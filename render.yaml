@@ -1,0 +1,27 @@
+# Render Blueprint - автодеплой JET Store Bot
+# https://render.com/docs/blueprint-spec
+
+services:
+  - type: web
+    name: jet-store-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: WEB_APP_URL
+        sync: false
+      - key: CRYPTO_PAY_TOKEN
+        sync: false
+      - key: FRAGMENT_API_KEY
+        sync: false
+      - key: TELEGRAM_API_ID
+        sync: false
+      - key: TELEGRAM_API_HASH
+        sync: false
+      - key: TELEGRAM_STRING_SESSION
+        sync: false

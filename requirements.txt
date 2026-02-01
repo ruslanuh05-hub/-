@@ -1,0 +1,5 @@
+# Бот JET Store: зависимости для Python 3.10+
+aiohttp>=3.9.0
+aiogram>=3.0.0
+telethon>=1.34.0
+gunicorn>=21.0.0
