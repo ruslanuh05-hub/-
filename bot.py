@@ -1476,19 +1476,28 @@ def setup_http_server():
 
     app.router.add_get('/api/telegram/user', get_telegram_user_handler)
 
+    CRYPTOBOT_USDT_AMOUNT = float(os.getenv("CRYPTOBOT_USDT_AMOUNT", "1") or "1")
+
     async def api_config_handler(request):
-        """Публичная конфигурация для фронтенда (бот, домен)"""
+        """Публичная конфигурация для фронтенда (бот, домен, CryptoBot USDT)"""
         try:
             me = await bot.get_me()
             bot_username = me.username or "JetStoreApp_bot"
-            return _json_response({
+            cfg = {
                 "bot_username": bot_username,
                 "web_app_url": WEB_APP_URL,
-                "domain": "jetstoreapp.ru"
-            })
+                "domain": "jetstoreapp.ru",
+                "cryptobot_usdt_amount": CRYPTOBOT_USDT_AMOUNT,
+            }
+            return _json_response(cfg)
         except Exception as e:
             logger.error(f"/api/config error: {e}")
-            return _json_response({"bot_username": "JetStoreApp_bot", "web_app_url": WEB_APP_URL, "domain": "jetstoreapp.ru"})
+            return _json_response({
+                "bot_username": "JetStoreApp_bot",
+                "web_app_url": WEB_APP_URL,
+                "domain": "jetstoreapp.ru",
+                "cryptobot_usdt_amount": CRYPTOBOT_USDT_AMOUNT,
+            })
 
     app.router.add_get('/api/config', api_config_handler)
 
@@ -1987,38 +1996,59 @@ def setup_http_server():
             body = await request.json()
         except Exception:
             return _json_response({"error": "bad_request", "message": "Invalid JSON"}, status=400)
-        amount = body.get("amount") or body.get("total_amount")
+        amount_usdt = body.get("amount_usdt")
+        amount_rub = body.get("amount") or body.get("total_amount")
+        use_usdt = amount_usdt is not None and str(amount_usdt).strip() != ""
         try:
-            amount = float(amount)
+            if use_usdt:
+                amount = float(amount_usdt)
+            else:
+                amount = float(amount_rub) if amount_rub is not None else 0
         except (TypeError, ValueError):
-            return _json_response({"error": "bad_request", "message": "amount is required (number)"}, status=400)
-        if amount < 1:
-            return _json_response({"error": "bad_request", "message": "Minimum amount 1 RUB"}, status=400)
-        if amount > 1_000_000:
-            return _json_response({"error": "bad_request", "message": "Maximum amount 1,000,000 RUB"}, status=400)
-        description = (body.get("description") or f"Оплата {amount:.0f} ₽").strip()[:1024]
+            return _json_response({"error": "bad_request", "message": "amount or amount_usdt is required (number)"}, status=400)
+        if use_usdt:
+            if amount < 0.1:
+                return _json_response({"error": "bad_request", "message": "Minimum USDT 0.1"}, status=400)
+            if amount > 100_000:
+                return _json_response({"error": "bad_request", "message": "Maximum USDT 100,000"}, status=400)
+        else:
+            if amount < 1:
+                return _json_response({"error": "bad_request", "message": "Minimum amount 1 RUB"}, status=400)
+            if amount > 1_000_000:
+                return _json_response({"error": "bad_request", "message": "Maximum amount 1,000,000 RUB"}, status=400)
+        description = (body.get("description") or (f"Оплата {amount:.2f} USDT" if use_usdt else f"Оплата {amount:.0f} ₽")).strip()[:1024]
         payload_data = body.get("payload") or ""
         if isinstance(payload_data, dict):
             payload_data = json.dumps(payload_data, ensure_ascii=False)[:4096]
         else:
             payload_data = str(payload_data)[:4096]
 
-        # По документации Crypto Pay API: https://help.send.tg/en/articles/10279948-crypto-pay-api
-        payload_obj = {
-            "currency_type": "fiat",
-            "fiat": "RUB",
-            "amount": f"{amount:.2f}",  # Строка в формате float, напр. "125.50"
-            "description": description,
-            "accepted_assets": "USDT,TON,BTC,ETH,TRX,USDC",
-            "payload": payload_data,
-            "paid_btn_name": "callback",
-            "paid_btn_url": WEB_APP_URL or "https://jetstoreapp.ru",
-        }
+        if use_usdt:
+            payload_obj = {
+                "currency_type": "crypto",
+                "asset": "USDT",
+                "amount": f"{amount:.2f}",
+                "description": description,
+                "payload": payload_data,
+                "paid_btn_name": "callback",
+                "paid_btn_url": WEB_APP_URL or "https://jetstoreapp.ru",
+            }
+        else:
+            payload_obj = {
+                "currency_type": "fiat",
+                "fiat": "RUB",
+                "amount": f"{amount:.2f}",
+                "description": description,
+                "accepted_assets": "USDT,TON,BTC,ETH,TRX,USDC",
+                "payload": payload_data,
+                "paid_btn_name": "callback",
+                "paid_btn_url": WEB_APP_URL or "https://jetstoreapp.ru",
+            }
         headers = {
             "Content-Type": "application/json",
             "Crypto-Pay-API-Token": CRYPTO_PAY_TOKEN,
         }
-        logger.info(f"CryptoBot createInvoice: amount={amount}, fiat=RUB")
+        logger.info(f"CryptoBot createInvoice: amount={amount}, mode={'USDT' if use_usdt else 'RUB'}")
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(f"{CRYPTO_PAY_BASE}/createInvoice", headers=headers, json=payload_obj) as resp:
