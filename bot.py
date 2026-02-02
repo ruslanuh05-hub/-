@@ -1462,8 +1462,10 @@ def setup_http_server():
             )
 
     app = web.Application(middlewares=[error_middleware])
-    # Хранилище оплаченных заказов Fragment (заполняется вебхуком order.completed)
-    app["fragment_completed_orders"] = set()
+    # Хранилище заказов Fragment.com (через сайт fragment.com/api по cookies+hash)
+    # Заказы Fragment.com (через сайт fragment.com/api по cookies+hash)
+    # order_id -> meta (type, recipient, quantity, created_at)
+    app["fragment_site_orders"] = {}
     # Preflight для CORS
     app.router.add_route('OPTIONS', '/api/telegram/user', lambda r: Response(status=204, headers={
         'Access-Control-Allow-Origin': '*',
@@ -1666,6 +1668,132 @@ def setup_http_server():
     CRYPTO_PAY_TOKEN = _get_env_clean("CRYPTO_PAY_TOKEN") or _cryptobot_cfg_early.get("api_token", "")
     CRYPTO_PAY_BASE = "https://pay.crypt.bot/api"
 
+    # Fragment.com (сайт) — вызов fragment.com/api через cookies + hash (как в fragment.py).
+    _fragment_site_cfg = _read_json_file(os.path.join(os.path.dirname(os.path.abspath(__file__)), "fragment_site_config.json"))
+    # Aliases for convenience:
+    # - FRAGMENT_COOKIES: same as FRAGMENT_SITE_COOKIES (full "Cookie:" header value)
+    # - FRAGMENT_HASH: same as FRAGMENT_SITE_HASH (value of ?hash=... used by fragment.com/api)
+    FRAGMENT_SITE_COOKIES = (
+        _get_env_clean("FRAGMENT_SITE_COOKIES")
+        or _get_env_clean("FRAGMENT_COOKIES")
+        or str(_fragment_site_cfg.get("cookies", "") or "").strip()
+    )
+    FRAGMENT_SITE_HASH = (
+        _get_env_clean("FRAGMENT_SITE_HASH")
+        or _get_env_clean("FRAGMENT_HASH")
+        or str(_fragment_site_cfg.get("hash", "") or "").strip()
+    )
+    FRAGMENT_SITE_ENABLED = bool(FRAGMENT_SITE_COOKIES and FRAGMENT_SITE_HASH)
+
+    def _fragment_site_headers(*, referer: str) -> dict:
+        return {
+            "accept": "application/json, text/javascript, */*; q=0.01",
+            "accept-language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+            "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "origin": "https://fragment.com",
+            "referer": referer,
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-origin",
+            "cookie": FRAGMENT_SITE_COOKIES,
+            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "x-requested-with": "XMLHttpRequest",
+        }
+
+    async def _fragment_site_post(method_payload: dict, *, referer: str) -> dict:
+        if not FRAGMENT_SITE_ENABLED:
+            raise RuntimeError("FRAGMENT_SITE_COOKIES/FRAGMENT_SITE_HASH not configured")
+        params = {"hash": FRAGMENT_SITE_HASH}
+        url = "https://fragment.com/api"
+        headers = _fragment_site_headers(referer=referer)
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, params=params, headers=headers, data=method_payload) as resp:
+                data = await resp.json(content_type=None)
+                if resp.status >= 400:
+                    raise RuntimeError(f"fragment.com/api error {resp.status}: {data}")
+                return data if isinstance(data, dict) else {"data": data}
+
+    def _extract_any_url(obj) -> str | None:
+        # Пытаемся найти URL в ответе Fragment (встречается как payment_url/link/url или внутри HTML)
+        if isinstance(obj, dict):
+            for k in ("payment_url", "paymentUrl", "pay_url", "payUrl", "url", "link"):
+                v = obj.get(k)
+                if isinstance(v, str) and v.startswith(("http://", "https://")):
+                    return v
+            for v in obj.values():
+                u = _extract_any_url(v)
+                if u:
+                    return u
+        elif isinstance(obj, list):
+            for v in obj:
+                u = _extract_any_url(v)
+                if u:
+                    return u
+        elif isinstance(obj, str):
+            m = re.search(r"https?://[^\s\"'<>]+", obj)
+            if m:
+                return m.group(0)
+        return None
+
+    def _fragment_site_is_paid(link_payload: dict) -> bool:
+        # У fragment.com/api нет публичной схемы. Пытаемся угадать по полям/тексту.
+        if not isinstance(link_payload, dict):
+            return False
+        for key in ("paid", "is_paid", "completed", "success"):
+            if link_payload.get(key) is True:
+                return True
+        tx = link_payload.get("transaction")
+        if isinstance(tx, dict):
+            for key in ("paid", "completed", "success"):
+                if tx.get(key) is True:
+                    return True
+            st = tx.get("status") or tx.get("state")
+            if isinstance(st, str) and st.lower() in ("paid", "completed", "success", "done"):
+                return True
+            if isinstance(st, int) and st in (2, 3, 4, 5):
+                return True
+        s = json.dumps(link_payload, ensure_ascii=False).lower()
+        if any(w in s for w in ("paid", "completed", "успеш", "оплачен", "оплачено")):
+            return True
+        return False
+
+    async def _fragment_site_create_star_order(app_: web.Application, *, recipient: str, stars_amount: int) -> dict:
+        referer = f"https://fragment.com/stars/buy?recipient={recipient}&quantity={stars_amount}"
+
+        # 1) Поиск получателя (иногда возвращается recipient-hash/токен)
+        search_payload = {"query": recipient, "quantity": "", "method": "searchStarsRecipient"}
+        search = await _fragment_site_post(search_payload, referer=referer)
+        recipient_token = None
+        if isinstance(search, dict):
+            recipient_token = search.get("recipient") or search.get("address") or None
+
+        # 2) Инициализация покупки
+        init_payload = {"recipient": recipient_token or recipient, "quantity": int(stars_amount), "method": "initBuyStarsRequest"}
+        init = await _fragment_site_post(init_payload, referer=referer)
+        req_id = None
+        if isinstance(init, dict):
+            for k in ("id", "req_id", "request_id", "requestId"):
+                if init.get(k):
+                    req_id = str(init.get(k))
+                    break
+        if not req_id:
+            req_id = str(init.get("data", {}).get("id")) if isinstance(init.get("data"), dict) else None
+        if not req_id or req_id == "None":
+            raise RuntimeError(f"Fragment initBuyStarsRequest: missing id in response: {init}")
+
+        # 3) Получение ссылки оплаты
+        link_payload = {"transaction": "1", "id": req_id, "show_sender": "0", "method": "getBuyStarsLink"}
+        link = await _fragment_site_post(link_payload, referer=referer)
+        pay_url = _extract_any_url(link)
+        if not pay_url:
+            raise RuntimeError(f"Fragment getBuyStarsLink: payment url not found: {link}")
+
+        orders = app_.get("fragment_site_orders")
+        if isinstance(orders, dict):
+            orders[req_id] = {"type": "stars", "recipient": recipient, "quantity": int(stars_amount), "created_at": time.time()}
+
+        return {"success": True, "order_id": req_id, "payment_url": pay_url, "order": {"search": search, "init": init, "link": link}}
+
     # Проверка оплаты (Fragment.com / TonKeeper / CryptoBot).
     async def payment_check_handler(request):
         try:
@@ -1680,9 +1808,26 @@ def setup_http_server():
         transaction_id = (body.get("transaction_id") or body.get("transactionId") or "").strip()
         invoice_id = body.get("invoice_id")
         method = (body.get("method") or "").strip().lower()
-        completed = request.app.get("fragment_completed_orders") or set()
-        if order_id and order_id in completed:
-            return _json_response({"paid": True, "order_id": order_id, "delivered_by_fragment": True})
+        # Fragment.com (site): пробуем проверить статус по order_id (req_id)
+        # Важно: пытаемся проверять даже если сервер перезапускался и meta не сохранилось.
+        if is_stars and order_id and FRAGMENT_SITE_ENABLED:
+            try:
+                site_orders = request.app.get("fragment_site_orders") or {}
+                meta = site_orders.get(order_id) if isinstance(site_orders, dict) else None
+                meta = meta or {}
+                rec = (meta.get("recipient") or "").strip()
+                qty = meta.get("quantity")
+                referer = "https://fragment.com/stars/buy"
+                if rec and qty:
+                    referer = f"https://fragment.com/stars/buy?recipient={rec}&quantity={qty}"
+                link_payload = {"transaction": "1", "id": str(order_id), "show_sender": "0", "method": "getBuyStarsLink"}
+                link = await _fragment_site_post(link_payload, referer=referer)
+                if _fragment_site_is_paid(link):
+                    return _json_response({"paid": True, "order_id": order_id, "delivered_by_fragment": True})
+                return _json_response({"paid": False, "order_id": order_id})
+            except Exception as e:
+                logger.warning(f"Fragment(site) payment check failed for order_id={order_id}: {e}")
+                return _json_response({"paid": False, "order_id": order_id})
         if invoice_id and method == "cryptobot" and CRYPTO_PAY_TOKEN:
             try:
                 async with aiohttp.ClientSession() as session:
@@ -1711,9 +1856,9 @@ def setup_http_server():
                 logger.warning(f"Crypto Pay check invoice {invoice_id}: {e}")
         if invoice_id and method == "cryptobot":
             return _json_response({"paid": False})
-        # Fragment (stars/premium) считаем оплаченным только после webhook (order_id в completed)
+        # Fragment.com (site flow): если не нашли заказ в памяти — подтвердить оплату не можем.
         if is_stars or is_premium:
-            return _json_response({"paid": False, "waiting_webhook": True, "order_id": order_id or None})
+            return _json_response({"paid": False, "order_id": order_id or None})
         if transaction_id:
             pass
         return _json_response({"paid": False})
@@ -1721,131 +1866,19 @@ def setup_http_server():
     app.router.add_post("/api/payment/check", payment_check_handler)
     app.router.add_route("OPTIONS", "/api/payment/check", lambda r: Response(status=204, headers=_cors_headers()))
     
-    # Fragment.com — выдача звёзд после покупки (iStar API)
-    # Документация: https://istar.fragmentapi.com/docs
-    _fragment_cfg = _read_json_file(os.path.join(os.path.dirname(os.path.abspath(__file__)), "fragment_config.json"))
-    FRAGMENT_API_KEY = _get_env_clean("FRAGMENT_API_KEY") or _fragment_cfg.get("api_key", "")
-    FRAGMENT_BASE = _fragment_cfg.get("base_url", "https://v1.fragmentapi.com/api/v1/partner") or "https://v1.fragmentapi.com/api/v1/partner"
-    
-    async def fragment_deliver_stars_handler(request):
-        """Выдача звёзд через fragment.com после успешной оплаты"""
-        if not FRAGMENT_API_KEY:
-            return _json_response({"error": "not_configured", "message": "FRAGMENT_API_KEY not set (fragment_config.json)"}, status=503)
-        try:
-            body = await request.json()
-        except Exception:
-            return _json_response({"error": "bad_request", "message": "Invalid JSON"}, status=400)
-        
-        stars_amount = body.get("stars_amount") or body.get("quantity")
-        recipient = (body.get("recipient") or body.get("username") or "").strip().lstrip("@")
-        
-        if not stars_amount:
-            return _json_response({"error": "bad_request", "message": "stars_amount is required"}, status=400)
-        stars_amount = int(stars_amount)
-        if stars_amount < 50:
-            return _json_response({"error": "bad_request", "message": "Minimum 50 stars"}, status=400)
-        if stars_amount > 1_000_000:
-            return _json_response({"error": "bad_request", "message": "Maximum 1,000,000 stars"}, status=400)
-        if not recipient:
-            return _json_response({"error": "bad_request", "message": "recipient (username) is required"}, status=400)
-        
-        headers = {"Content-Type": "application/json", "API-Key": FRAGMENT_API_KEY}
-        
-        try:
-            async with aiohttp.ClientSession() as session:
-                # 1) Валидация получателя
-                async with session.get(
-                    f"{FRAGMENT_BASE}/star/recipient/search",
-                    params={"username": recipient, "quantity": stars_amount},
-                    headers={"API-Key": FRAGMENT_API_KEY}
-                ) as resp:
-                    val_data = await resp.json(content_type=None) if resp.content_type else {}
-                    if resp.status >= 400:
-                        return _json_response({
-                            "error": "fragment_validation",
-                            "message": val_data.get("message", val_data.get("error", "Invalid recipient")),
-                            "details": val_data
-                        }, status=400)
-                    recipient_hash = val_data.get("recipient")
-                    if not recipient_hash:
-                        return _json_response({"error": "fragment_validation", "message": "Recipient not found"}, status=400)
-                
-                # 2) Создание заказа на выдачу звёзд
-                payload = {"username": recipient, "recipient_hash": recipient_hash, "quantity": stars_amount, "wallet_type": "TON"}
-                async with session.post(f"{FRAGMENT_BASE}/orders/star", headers=headers, json=payload) as resp:
-                    data = await resp.json(content_type=None) if resp.content_type else {}
-                    if resp.status >= 400:
-                        return _json_response({
-                            "error": "fragment_error",
-                            "message": data.get("message", data.get("error", "Fragment API error")),
-                            "details": data
-                        }, status=502)
-                    return _json_response({"success": True, "order": data, "stars_amount": stars_amount, "recipient": recipient})
-        except Exception as e:
-            logger.error(f"Fragment deliver stars error: {e}")
-            return _json_response({"error": "internal_error", "message": str(e)}, status=500)
-    
-    app.router.add_post("/api/fragment/deliver-stars", fragment_deliver_stars_handler)
-    app.router.add_route('OPTIONS', '/api/fragment/deliver-stars', lambda r: Response(status=204, headers=_cors_headers()))
+    async def fragment_status_handler(request):
+    async def fragment_status_handler(request):
+        """Healthcheck Fragment.com site flow (cookies+hash)."""
+        if not FRAGMENT_SITE_ENABLED:
+            return _json_response({"configured": False, "api_ok": False, "mode": "site"}, status=503)
+        return _json_response({"configured": True, "api_ok": True, "mode": "site"})
 
-    async def fragment_deliver_premium_handler(request):
-        """Выдача Premium через fragment.com (iStar API), оплата TonKeeper"""
-        if not FRAGMENT_API_KEY:
-            return _json_response({"error": "not_configured", "message": "FRAGMENT_API_KEY not set (fragment_config.json)"}, status=503)
-        try:
-            body = await request.json()
-        except Exception:
-            return _json_response({"error": "bad_request", "message": "Invalid JSON"}, status=400)
-        recipient = (body.get("recipient") or body.get("username") or "").strip().lstrip("@")
-        months = body.get("months", 3)
-        try:
-            months = int(months)
-        except (TypeError, ValueError):
-            months = 3
-        if months not in (3, 6, 12):
-            months = 3
-        if not recipient:
-            return _json_response({"error": "bad_request", "message": "recipient (username) is required"}, status=400)
-        headers = {"Content-Type": "application/json", "API-Key": FRAGMENT_API_KEY}
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{FRAGMENT_BASE}/premium/recipient/search",
-                    params={"username": recipient, "months": months},
-                    headers={"API-Key": FRAGMENT_API_KEY}
-                ) as resp:
-                    val_data = await resp.json(content_type=None) if resp.content_type else {}
-                    if resp.status >= 400:
-                        return _json_response({
-                            "error": "fragment_validation",
-                            "message": val_data.get("message", val_data.get("error", "Invalid recipient")),
-                            "details": val_data
-                        }, status=400)
-                    recipient_hash = val_data.get("recipient")
-                    if not recipient_hash:
-                        return _json_response({"error": "fragment_validation", "message": "Recipient not found"}, status=400)
-                payload = {"username": recipient, "recipient_hash": recipient_hash, "months": months, "wallet_type": "TON"}
-                async with session.post(f"{FRAGMENT_BASE}/orders/premium", headers=headers, json=payload) as resp:
-                    data = await resp.json(content_type=None) if resp.content_type else {}
-                    if resp.status >= 400:
-                        return _json_response({
-                            "error": "fragment_error",
-                            "message": data.get("message", data.get("error", "Fragment API error")),
-                            "details": data
-                        }, status=502)
-                    return _json_response({"success": True, "order": data, "months": months, "recipient": recipient})
-        except Exception as e:
-            logger.error(f"Fragment deliver premium error: {e}")
-            return _json_response({"error": "internal_error", "message": str(e)}, status=500)
-
-    app.router.add_post("/api/fragment/deliver-premium", fragment_deliver_premium_handler)
-    app.router.add_route("OPTIONS", "/api/fragment/deliver-premium", lambda r: Response(status=204, headers=_cors_headers()))
+    app.router.add_get("/api/fragment/status", fragment_status_handler)
+    app.router.add_route("OPTIONS", "/api/fragment/status", lambda r: Response(status=204, headers=_cors_headers()))
 
     # Создание заказа Fragment (звёзды/премиум) — пользователь оплачивает в Fragment/TonKeeper, затем вебхук → payment_check по order_id
     async def fragment_create_star_order_handler(request):
         """Создать заказ на звёзды: возвращает order_id и payment_url (если API отдаёт), фронт открывает ссылку оплаты TonKeeper"""
-        if not FRAGMENT_API_KEY:
-            return _json_response({"error": "not_configured", "message": "FRAGMENT_API_KEY not set"}, status=503)
         try:
             body = await request.json()
         except Exception:
@@ -1859,115 +1892,42 @@ def setup_http_server():
             return _json_response({"error": "bad_request", "message": "stars_amount 50..1000000"}, status=400)
         if not recipient:
             return _json_response({"error": "bad_request", "message": "recipient is required"}, status=400)
-        headers = {"Content-Type": "application/json", "API-Key": FRAGMENT_API_KEY}
+
+        # Fragment.com (site): fragment.com/api по cookies+hash (как в fragment.py)
+        if not FRAGMENT_SITE_ENABLED:
+            return _json_response({
+                "error": "not_configured",
+                "message": "Set FRAGMENT_SITE_COOKIES + FRAGMENT_SITE_HASH (or aliases FRAGMENT_COOKIES + FRAGMENT_HASH)"
+            }, status=503)
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{FRAGMENT_BASE}/star/recipient/search",
-                    params={"username": recipient, "quantity": stars_amount},
-                    headers={"API-Key": FRAGMENT_API_KEY}
-                ) as resp:
-                    val_data = await resp.json(content_type=None) if resp.content_type else {}
-                    if resp.status >= 400 or not val_data.get("recipient"):
-                        return _json_response({
-                            "error": "fragment_validation",
-                            "message": val_data.get("message", "Recipient not found")
-                        }, status=400)
-                    recipient_hash = val_data.get("recipient")
-                payload = {"username": recipient, "recipient_hash": recipient_hash, "quantity": stars_amount, "wallet_type": "TON"}
-                async with session.post(f"{FRAGMENT_BASE}/orders/star", headers=headers, json=payload) as resp:
-                    data = await resp.json(content_type=None) if resp.content_type else {}
-                    if resp.status >= 400:
-                        return _json_response({
-                            "error": "fragment_error",
-                            "message": data.get("message", data.get("error", "Fragment API error"))
-                        }, status=502)
-                    order_id = data.get("order_id") or data.get("id") or ""
-                    payment_url = data.get("payment_link") or data.get("payment_url") or data.get("pay_url") or ""
-                    return _json_response({
-                        "success": True, "order_id": order_id, "payment_url": payment_url or None,
-                        "order": data, "stars_amount": stars_amount, "recipient": recipient
-                    })
+            res = await _fragment_site_create_star_order(request.app, recipient=recipient, stars_amount=stars_amount)
+            return _json_response({
+                "success": True,
+                "order_id": res.get("order_id"),
+                "payment_url": res.get("payment_url"),
+                "order": res.get("order"),
+                "stars_amount": stars_amount,
+                "recipient": recipient,
+                "mode": "site",
+            })
         except Exception as e:
-            logger.error(f"Fragment create star order error: {e}")
-            return _json_response({"error": "internal_error", "message": str(e)}, status=500)
+            logger.error(f"Fragment(site) create star order error: {e}")
+            return _json_response({"error": "fragment_site_error", "message": str(e)}, status=502)
 
     async def fragment_create_premium_order_handler(request):
         """Создать заказ на Premium: возвращает order_id и payment_url (если есть), фронт открывает оплату TonKeeper"""
-        if not FRAGMENT_API_KEY:
-            return _json_response({"error": "not_configured", "message": "FRAGMENT_API_KEY not set"}, status=503)
-        try:
-            body = await request.json()
-        except Exception:
-            return _json_response({"error": "bad_request", "message": "Invalid JSON"}, status=400)
-        recipient = (body.get("recipient") or body.get("username") or "").strip().lstrip("@")
-        months = body.get("months", 3)
-        try:
-            months = int(months)
-        except (TypeError, ValueError):
-            months = 3
-        if months not in (3, 6, 12):
-            months = 3
-        if not recipient:
-            return _json_response({"error": "bad_request", "message": "recipient is required"}, status=400)
-        headers = {"Content-Type": "application/json", "API-Key": FRAGMENT_API_KEY}
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{FRAGMENT_BASE}/premium/recipient/search",
-                    params={"username": recipient, "months": months},
-                    headers={"API-Key": FRAGMENT_API_KEY}
-                ) as resp:
-                    val_data = await resp.json(content_type=None) if resp.content_type else {}
-                    if resp.status >= 400 or not val_data.get("recipient"):
-                        return _json_response({
-                            "error": "fragment_validation",
-                            "message": val_data.get("message", "Recipient not found")
-                        }, status=400)
-                    recipient_hash = val_data.get("recipient")
-                payload = {"username": recipient, "recipient_hash": recipient_hash, "months": months, "wallet_type": "TON"}
-                async with session.post(f"{FRAGMENT_BASE}/orders/premium", headers=headers, json=payload) as resp:
-                    data = await resp.json(content_type=None) if resp.content_type else {}
-                    if resp.status >= 400:
-                        return _json_response({
-                            "error": "fragment_error",
-                            "message": data.get("message", data.get("error", "Fragment API error"))
-                        }, status=502)
-                    order_id = data.get("order_id") or data.get("id") or ""
-                    payment_url = data.get("payment_link") or data.get("payment_url") or data.get("pay_url") or ""
-                    return _json_response({
-                        "success": True, "order_id": order_id, "payment_url": payment_url or None,
-                        "order": data, "months": months, "recipient": recipient
-                    })
-        except Exception as e:
-            logger.error(f"Fragment create premium order error: {e}")
-            return _json_response({"error": "internal_error", "message": str(e)}, status=500)
+        return _json_response(
+            {
+                "error": "not_supported",
+                "message": "Premium отключён: оставлен только режим Stars через fragment.com cookies+hash.",
+            },
+            status=501,
+        )
 
     app.router.add_post("/api/fragment/create-star-order", fragment_create_star_order_handler)
     app.router.add_route("OPTIONS", "/api/fragment/create-star-order", lambda r: Response(status=204, headers=_cors_headers()))
     app.router.add_post("/api/fragment/create-premium-order", fragment_create_premium_order_handler)
     app.router.add_route("OPTIONS", "/api/fragment/create-premium-order", lambda r: Response(status=204, headers=_cors_headers()))
-
-    # Вебхук Fragment (iStar): order.completed / order.failed — сохраняем оплаченные заказы для payment_check
-    async def fragment_webhook_handler(request):
-        try:
-            body = await request.json()
-        except Exception:
-            return _json_response({"error": "invalid_payload"}, status=400)
-        event_type = body.get("event_type") or (request.headers.get("X-iStar-Event") or "").strip()
-        order = body.get("order") or {}
-        order_id = (order.get("id") or "").strip()
-        if event_type == "order.completed" and order_id:
-            completed = request.app.get("fragment_completed_orders")
-            if completed is not None:
-                completed.add(order_id)
-                logger.info(f"Fragment webhook: order {order_id} marked as completed")
-        elif event_type == "order.failed" and order_id:
-            logger.warning(f"Fragment webhook: order {order_id} failed")
-        return _json_response({"ok": True})
-    
-    app.router.add_post("/api/fragment/webhook", fragment_webhook_handler)
-    app.router.add_route("OPTIONS", "/api/fragment/webhook", lambda r: Response(status=204, headers=_cors_headers()))
 
     # Health check
     async def api_health_handler(request):
