@@ -1467,6 +1467,8 @@ def setup_http_server():
     # Заказы Fragment.com (через сайт fragment.com/api по cookies+hash)
     # order_id -> meta (type, recipient, quantity, created_at)
     app["fragment_site_orders"] = {}
+    # TON-оплата через Tonkeeper: order_id -> { amount_nanoton, amount_ton, amount_rub, purchase, user_id, created_at }
+    app["ton_orders"] = {}
     # Preflight для CORS
     app.router.add_route('OPTIONS', '/api/telegram/user', lambda r: Response(status=204, headers={
         'Access-Control-Allow-Origin': '*',
@@ -1523,6 +1525,65 @@ def setup_http_server():
 
     app.router.add_get('/api/ton-rate', ton_rate_handler)
     app.router.add_route('OPTIONS', '/api/ton-rate', lambda r: Response(status=204, headers=_cors_headers()))
+
+    TON_PAYMENT_ADDRESS = {"value": (os.getenv("TON_PAYMENT_ADDRESS") or "").strip()}
+
+    async def _get_ton_rate_rub() -> float:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get("https://api.coinpaprika.com/v1/tickers/ton-toncoin?quotes=RUB") as resp:
+                    data = await resp.json(content_type=None) if resp.content_type else {}
+            if data and data.get("quotes") and data["quotes"].get("RUB"):
+                p = float(data["quotes"]["RUB"].get("price", 0) or 0)
+                if p > 0:
+                    return round(p, 2)
+        except Exception as e:
+            logger.warning(f"TON rate for create-order: {e}")
+        return 600.0
+
+    async def ton_create_order_handler(request):
+        addr = TON_PAYMENT_ADDRESS.get("value") or ""
+        if not addr:
+            return _json_response({"error": "not_configured", "message": "TON_PAYMENT_ADDRESS не задан"}, status=503)
+        try:
+            body = await request.json()
+        except Exception:
+            return _json_response({"error": "bad_request", "message": "Invalid JSON"}, status=400)
+        amount_rub = float(body.get("amount_rub") or body.get("amount") or 0)
+        if amount_rub <= 0:
+            return _json_response({"error": "bad_request", "message": "amount_rub должен быть > 0"}, status=400)
+        rate = await _get_ton_rate_rub()
+        amount_ton = round(amount_rub / rate, 4)
+        if amount_ton <= 0:
+            return _json_response({"error": "bad_request", "message": "Сумма в TON слишком мала"}, status=400)
+        amount_nanoton = int(round(amount_ton * 1e9))
+        import uuid
+        order_id = str(uuid.uuid4()).replace("-", "")[:24]
+        purchase = body.get("purchase") or {}
+        user_id = body.get("user_id") or (purchase.get("userId") if isinstance(purchase.get("userId"), str) else None) or "unknown"
+        ton_orders = request.app.get("ton_orders") or {}
+        ton_orders[order_id] = {
+            "amount_nanoton": amount_nanoton,
+            "amount_ton": amount_ton,
+            "amount_rub": amount_rub,
+            "purchase": purchase,
+            "user_id": user_id,
+            "created_at": time.time(),
+        }
+        request.app["ton_orders"] = ton_orders
+        comment = order_id
+        return _json_response({
+            "success": True,
+            "order_id": order_id,
+            "payment_address": addr,
+            "amount_ton": amount_ton,
+            "amount_nanoton": amount_nanoton,
+            "comment": comment,
+            "ton_rate_rub": rate,
+        })
+
+    app.router.add_post("/api/ton/create-order", ton_create_order_handler)
+    app.router.add_route("OPTIONS", "/api/ton/create-order", lambda r: Response(status=204, headers=_cors_headers()))
 
     async def ton_pack_address_handler(request):
         """Конвертация raw-адреса TON (0:hex) в user-friendly через TonCenter."""
@@ -1680,6 +1741,8 @@ def setup_http_server():
             _fragment_site_cfg = _parent_cfg
     if not _fragment_site_cfg:
         logger.warning("fragment_site_config.json не найден (искали в %s и cwd); задайте TONAPI_KEY и MNEMONIC в переменных окружения", _script_dir)
+    if not TON_PAYMENT_ADDRESS.get("value") and _fragment_site_cfg:
+        TON_PAYMENT_ADDRESS["value"] = str(_fragment_site_cfg.get("ton_payment_address") or "").strip()
     FRAGMENT_SITE_COOKIES = (
         _get_env_clean("FRAGMENT_SITE_COOKIES")
         or _get_env_clean("FRAGMENT_COOKIES")
@@ -1894,6 +1957,42 @@ def setup_http_server():
             except Exception as e:
                 logger.warning(f"Fragment(site) payment check failed for order_id={order_id}: {e}")
                 return _json_response({"paid": False, "order_id": order_id})
+        # TON (Tonkeeper): проверка входящего перевода по order_id и комментарию в tx
+        _ton_addr = (TON_PAYMENT_ADDRESS.get("value") or "").strip()
+        if method == "ton" and order_id and _ton_addr:
+            ton_orders = request.app.get("ton_orders") or {}
+            order = ton_orders.get(order_id) if isinstance(ton_orders, dict) else None
+            if order and TONAPI_KEY:
+                try:
+                    addr = _ton_addr
+                    if re.match(r"^[A-Za-z0-9_-]{48}$", addr):
+                        pass
+                    else:
+                        addr = addr.replace(" ", "").replace("://", "")
+                    url = f"https://tonapi.io/v2/accounts/{addr}/events?limit=50"
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(
+                            url,
+                            headers={"Authorization": f"Bearer {TONAPI_KEY}", "Content-Type": "application/json"}
+                        ) as resp:
+                            data = await resp.json(content_type=None) if resp.content_type else {}
+                    events = data.get("events") or []
+                    want_nanoton = order.get("amount_nanoton") or 0
+                    want_comment = order_id
+                    for ev in events:
+                        for act in ev.get("actions") or []:
+                            if act.get("type") == "TonTransfer":
+                                comment = (act.get("comment") or act.get("payload") or "")
+                                if isinstance(comment, dict):
+                                    comment = (comment.get("text") or comment.get("comment") or (comment.get("decoded_body") or {}).get("text") or "").strip()
+                                else:
+                                    comment = str(comment).strip()
+                                amount = int(act.get("amount") or 0)
+                                if comment == want_comment and amount >= max(0, want_nanoton - int(1e6)):
+                                    return _json_response({"paid": True, "order_id": order_id, "method": "ton"})
+                except Exception as e:
+                    logger.warning(f"TON payment check failed for order_id={order_id}: {e}")
+            return _json_response({"paid": False, "order_id": order_id})
         if invoice_id and method == "cryptobot" and CRYPTO_PAY_TOKEN:
             try:
                 async with aiohttp.ClientSession() as session:
