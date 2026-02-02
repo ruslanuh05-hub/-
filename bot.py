@@ -1693,17 +1693,27 @@ def setup_http_server():
                     ) as resp:
                         cdata = await resp.json(content_type=None) if resp.content_type else {}
                         if cdata.get("ok"):
-                            items = cdata.get("result")
+                            result = cdata.get("result")
+                            # Crypto Pay API обычно возвращает {"result": {"items": [...]}}
+                            items = []
+                            if isinstance(result, dict):
+                                items = result.get("items") or []
+                            elif isinstance(result, list):
+                                items = result
                             if isinstance(items, list):
-                                for inv in items:
-                                    if str(inv.get("invoice_id")) == str(invoice_id) and inv.get("status") == "paid":
-                                        return _json_response({"paid": True, "invoice_id": invoice_id})
+                                paid = any(
+                                    str(inv.get("invoice_id")) == str(invoice_id) and inv.get("status") == "paid"
+                                    for inv in items if isinstance(inv, dict)
+                                )
+                                if paid:
+                                    return _json_response({"paid": True, "invoice_id": invoice_id})
             except Exception as e:
                 logger.warning(f"Crypto Pay check invoice {invoice_id}: {e}")
         if invoice_id and method == "cryptobot":
             return _json_response({"paid": False})
+        # Fragment (stars/premium) считаем оплаченным только после webhook (order_id в completed)
         if is_stars or is_premium:
-            return _json_response({"paid": True})
+            return _json_response({"paid": False, "waiting_webhook": True, "order_id": order_id or None})
         if transaction_id:
             pass
         return _json_response({"paid": False})
