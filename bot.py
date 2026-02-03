@@ -1991,12 +1991,42 @@ def setup_http_server():
             except Exception as e:
                 logger.warning(f"Fragment(site) payment check failed for order_id={order_id}: {e}")
                 return _json_response({"paid": False, "order_id": order_id})
-        # TON (Tonkeeper): УПРОЩЁННОЕ подтверждение — доверяем нажатию «Подтвердить оплату» в мини‑аппе.
-        if method == "ton":
-            if order_id:
-                logger.info("TON payment auto-confirmed (no blockchain check) for order_id=%s", order_id)
-                return _json_response({"paid": True, "order_id": order_id, "method": "ton"})
-            return _json_response({"paid": False, "order_id": None})
+        # TON (Tonkeeper): строгая проверка через TonAPI по сумме и уникальному order_id в действии
+        _ton_addr = (TON_PAYMENT_ADDRESS.get("value") or "").strip()
+        if method == "ton" and order_id and _ton_addr and TONAPI_KEY:
+            ton_orders = request.app.get("ton_orders") or {}
+            order = ton_orders.get(order_id) if isinstance(ton_orders, dict) else None
+            if order:
+                try:
+                    addr = _ton_addr.strip()
+                    if not re.match(r"^[A-Za-z0-9_-]{48}$", addr):
+                        addr = addr.replace(" ", "").replace("://", "")
+                    url = f"https://tonapi.io/v2/accounts/{addr}/events?limit=50"
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(
+                            url,
+                            headers={"Authorization": f"Bearer {TONAPI_KEY}", "Content-Type": "application/json"}
+                        ) as resp:
+                            data = await resp.json(content_type=None) if resp.content_type else {}
+                    events = data.get("events") or []
+                    want_nanoton = int(order.get("amount_nanoton") or 0)
+                    # Проходим по всем TonTransfer и ищем тот, в JSON которого встречается order_id и хватает суммы
+                    for ev in events:
+                        for act in ev.get("actions") or []:
+                            if act.get("type") == "TonTransfer":
+                                try:
+                                    blob = json.dumps(act, ensure_ascii=False)
+                                except Exception:
+                                    blob = str(act)
+                                if order_id not in blob:
+                                    continue
+                                amount = int(act.get("amount") or 0)
+                                if amount >= max(0, want_nanoton - int(1e6)):
+                                    logger.info("TON payment confirmed via TonAPI for order_id=%s, amount=%s", order_id, amount)
+                                    return _json_response({"paid": True, "order_id": order_id, "method": "ton"})
+                except Exception as e:
+                    logger.warning(f"TON payment check failed for order_id={order_id}: {e}")
+            return _json_response({"paid": False, "order_id": order_id})
         if invoice_id and method == "cryptobot" and CRYPTO_PAY_TOKEN:
             try:
                 async with aiohttp.ClientSession() as session:
