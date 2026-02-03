@@ -5,6 +5,7 @@ import os
 import re
 import base64
 import time
+import uuid
 from io import BytesIO
 from datetime import datetime
 from typing import Optional, Union
@@ -49,6 +50,10 @@ TON_NOTIFY_CHAT_ID = int(os.getenv("TON_NOTIFY_CHAT_ID", "0") or "0")
 
 # Курс выплаты за 1 звезду (RUB), используем тот же, что в мини-аппе
 STAR_BUY_RATE_RUB = float(os.getenv("STAR_BUY_RATE_RUB", "0.65") or "0.65")
+
+# Заказы на продажу звёзд из мини-приложения: order_id -> { user_id, username, first_name, last_name, stars_amount, method, payout_* }
+# После successful_payment по payload "sell_stars:order_id" отправляем уведомление и удаляем запись
+PENDING_SELL_STARS_ORDERS = {}
 
 # ============ USERBOT (Telethon / MTProto) ============
 # Чтобы искать любого пользователя по @username без /start, нужен userbot:
@@ -694,8 +699,49 @@ async def process_successful_payment(message: types.Message):
 
     payload = sp.invoice_payload or ""
     user = message.from_user
-    
-    # Продажа звёзд (sellstars:amount)
+
+    # Продажа звёзд из мини-приложения (sell_stars:order_id) — есть данные выплаты
+    if payload.startswith("sell_stars:"):
+        order_id = payload.split(":", 1)[1].strip()
+        order = PENDING_SELL_STARS_ORDERS.pop(order_id, None)
+        stars = sp.total_amount
+        payout_rub = stars * STAR_BUY_RATE_RUB
+        seller_username = f"@{user.username}" if user.username else (user.full_name or str(user.id))
+
+        notify_text = (
+            "‼️ <b>Новая продажа звёзд</b>\n\n"
+            f"Продавец: {seller_username}\n"
+            f"ID: <code>{user.id}</code>\n"
+            f"Имя: {user.first_name or ''} {user.last_name or ''}\n"
+            f"Продано звёзд: <b>{stars}</b> ⭐\n"
+            f"Сумма выплаты: <b>{payout_rub:.2f} ₽</b>\n"
+        )
+        if order:
+            method = order.get("method") or "wallet"
+            notify_text += "\n<b>Выплата:</b> "
+            if method == "wallet":
+                notify_text += f"Кошелёк\nАдрес: <code>{order.get('wallet_address') or '—'}</code>\n"
+                if order.get("wallet_memo"):
+                    notify_text += f"Memo: <code>{order['wallet_memo']}</code>\n"
+            elif method == "sbp":
+                notify_text += f"СБП\nТелефон: <code>{order.get('sbp_phone') or '—'}</code>\nБанк: {order.get('sbp_bank') or '—'}\n"
+            elif method == "card":
+                notify_text += f"Карта\nНомер: <code>{order.get('card_number') or '—'}</code>\nБанк: {order.get('card_bank') or '—'}\n"
+
+        await message.answer(
+            "✅ Оплата звёздами получена!\n\n"
+            f"Мы выплатим тебе примерно <b>{payout_rub:.2f} ₽</b> за {stars} ⭐.\n"
+            "Ожидай обработки заявки.",
+            parse_mode="HTML"
+        )
+        if SELL_STARS_NOTIFY_CHAT_ID:
+            try:
+                await bot.send_message(SELL_STARS_NOTIFY_CHAT_ID, notify_text, parse_mode="HTML")
+            except Exception as e:
+                logger.error(f"Не удалось отправить уведомление о продаже звёзд: {e}")
+        return
+
+    # Продажа звёзд из чата (sellstars:amount) — без данных выплаты
     if payload.startswith("sellstars:"):
         try:
             stars = int(payload.split(":", 1)[1])
@@ -713,7 +759,6 @@ async def process_successful_payment(message: types.Message):
             f"Сумма выплаты: <b>{payout_rub:.2f} ₽</b>\n"
         )
 
-        # Уведомление пользователю
         await message.answer(
             "✅ Оплата звёздами получена!\n\n"
             f"Мы выплатим тебе примерно <b>{payout_rub:.2f} ₽</b> за {stars} ⭐.\n"
@@ -721,7 +766,6 @@ async def process_successful_payment(message: types.Message):
             parse_mode="HTML"
         )
 
-        # Уведомление в группу/канал (если задан CHAT_ID)
         if SELL_STARS_NOTIFY_CHAT_ID:
             try:
                 await bot.send_message(SELL_STARS_NOTIFY_CHAT_ID, notify_text, parse_mode="HTML")
@@ -1696,6 +1740,85 @@ def setup_http_server():
 
     app.router.add_post("/api/ton/notify", ton_notify_handler)
     app.router.add_route("OPTIONS", "/api/ton/notify", lambda r: Response(status=204, headers=_cors_headers()))
+
+    # Продажа звёзд из мини-приложения: создать счёт XTR и сохранить данные выплаты
+    async def sellstars_create_invoice_handler(request):
+        try:
+            body = await request.json()
+        except Exception:
+            return _json_response({"error": "bad_request", "message": "Invalid JSON"}, status=400)
+
+        telegram_id = body.get("telegram_id") or body.get("user_id")
+        if telegram_id is None:
+            return _json_response({"error": "bad_request", "message": "telegram_id обязателен"}, status=400)
+        try:
+            telegram_id = int(telegram_id)
+        except (TypeError, ValueError):
+            return _json_response({"error": "bad_request", "message": "telegram_id должен быть числом"}, status=400)
+
+        stars_amount = body.get("stars_amount")
+        try:
+            stars_amount = int(stars_amount) if stars_amount is not None else 0
+        except (TypeError, ValueError):
+            stars_amount = 0
+        if stars_amount < 100:
+            return _json_response({"error": "bad_request", "message": "Минимум 100 звёзд"}, status=400)
+        if stars_amount > 50000:
+            return _json_response({"error": "bad_request", "message": "Максимум 50 000 звёзд"}, status=400)
+
+        method = (body.get("method") or "wallet").strip().lower()
+        if method not in ("wallet", "sbp", "card"):
+            return _json_response({"error": "bad_request", "message": "method: wallet, sbp или card"}, status=400)
+
+        order_id = str(uuid.uuid4())
+        payout_rub = round(stars_amount * STAR_BUY_RATE_RUB, 2)
+
+        order_data = {
+            "user_id": telegram_id,
+            "username": (body.get("username") or "").strip(),
+            "first_name": (body.get("first_name") or "").strip(),
+            "last_name": (body.get("last_name") or "").strip(),
+            "stars_amount": stars_amount,
+            "method": method,
+            "payout_rub": payout_rub,
+        }
+        if method == "wallet":
+            order_data["wallet_address"] = (body.get("wallet_address") or "").strip()
+            order_data["wallet_memo"] = (body.get("wallet_memo") or "").strip()
+        elif method == "sbp":
+            order_data["sbp_phone"] = (body.get("sbp_phone") or "").strip()
+            order_data["sbp_bank"] = (body.get("sbp_bank") or "").strip()
+        elif method == "card":
+            order_data["card_number"] = (body.get("card_number") or "").strip()
+            order_data["card_bank"] = (body.get("card_bank") or "").strip()
+
+        PENDING_SELL_STARS_ORDERS[order_id] = order_data
+
+        try:
+            await bot.send_invoice(
+                chat_id=telegram_id,
+                title="Продажа звёзд",
+                description=f"Продажа {stars_amount} ⭐. Вы получите примерно {payout_rub:.2f} ₽.",
+                payload=f"sell_stars:{order_id}",
+                provider_token="1744374395:TEST:36675594277e9de887a6",
+                currency="XTR",
+                prices=[LabeledPrice(label="Звёзды", amount=stars_amount)],
+                max_tip_amount=0,
+                need_name=False,
+                need_phone_number=False,
+                need_email=False,
+                need_shipping_address=False,
+                is_flexible=False,
+            )
+        except Exception as e:
+            PENDING_SELL_STARS_ORDERS.pop(order_id, None)
+            logger.exception(f"sellstars create-invoice send_invoice: {e}")
+            return _json_response({"error": "send_failed", "message": str(e)}, status=502)
+
+        return _json_response({"success": True, "order_id": order_id})
+
+    app.router.add_post("/api/sellstars/create-invoice", sellstars_create_invoice_handler)
+    app.router.add_route("OPTIONS", "/api/sellstars/create-invoice", lambda r: Response(status=204, headers=_cors_headers()))
 
     async def ton_pack_address_handler(request):
         """Конвертация raw-адреса TON (0:hex) в user-friendly через TonCenter."""
