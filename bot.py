@@ -1974,11 +1974,11 @@ def setup_http_server():
         volume_ton = round(volume_rub / ton_rate, 6) if volume_rub > 0 else 0.0
 
         # Уровни JetRefs по объёму в TON:
-        # 1 уровень: 0–4999.99 TON
-        # 2 уровень: 5000–14999.99 TON
-        # 3 уровень: 15000+ TON
-        L2_TON = 5000.0
-        L3_TON = 15000.0
+        # 1 уровень: 0–999.99 TON
+        # 2 уровень: 1000–4999.99 TON
+        # 3 уровень: 5000+ TON
+        L2_TON = 1000.0
+        L3_TON = 5000.0
         max_level = 3
         if volume_ton >= L3_TON:
             level = 3
@@ -1998,6 +1998,7 @@ def setup_http_server():
             progress_percent = int(round(min(1.0, done / span) * 100))
             remaining_ton = max(0.0, target - volume_ton)
             to_next_volume_rub = remaining_ton * ton_rate
+            to_next_volume_ton = remaining_ton  # Добавляем также в TON для удобства
 
         payload = {
             "user_id": uid,
@@ -2013,6 +2014,7 @@ def setup_http_server():
             "max_level": max_level,
             "progress_percent": progress_percent,
             "to_next_volume_rub": round(to_next_volume_rub, 2),
+            "to_next_volume_ton": round(remaining_ton, 2) if level < max_level else 0.0,
             "ton_rate_rub": ton_rate,
         }
         return _json_response(payload)
