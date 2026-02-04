@@ -53,7 +53,19 @@ STAR_BUY_RATE_RUB = float(os.getenv("STAR_BUY_RATE_RUB", "0.65") or "0.65")
 
 # Заказы на продажу звёзд из мини-приложения: order_id -> { user_id, username, first_name, last_name, stars_amount, method, payout_* }
 # После successful_payment по payload "sell_stars:order_id" отправляем уведомление и удаляем запись
-PENDING_SELL_STARS_ORDERS = {}
+PENDING_SELL_STARS_ORDERS: dict[str, dict] = {}
+
+# Реферальная система
+# referrals_data.json: user_id(str) -> {
+#   "parent1": str|None, "parent2": str|None, "parent3": str|None,
+#   "referrals_l1": [str], "referrals_l2": [str], "referrals_l3": [str],
+#   "earned_rub": float, "volume_rub": float
+# }
+REFERRALS: dict[str, dict] = {}
+REFERRALS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "referrals_data.json")
+
+# Чат, куда слать заявки на вывод реферальных средств
+REFERRAL_WITHDRAW_CHAT_ID = int(os.getenv("REFERRAL_WITHDRAW_CHAT_ID", "0") or "0")
 
 # ============ USERBOT (Telethon / MTProto) ============
 # Чтобы искать любого пользователя по @username без /start, нужен userbot:
@@ -70,6 +82,119 @@ def _read_json_file(path: str) -> dict:
     except Exception as e:
         logger.warning(f"Не удалось прочитать JSON {path}: {e}")
     return {}
+
+
+def _save_json_file(path: str, data: dict) -> None:
+    """Безопасная запись JSON на диск."""
+    try:
+        tmp_path = path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, path)
+    except Exception as e:
+        logger.warning(f"Не удалось сохранить JSON {path}: {e}")
+
+
+def _load_referrals() -> None:
+    """Загружаем реферальные данные из файла один раз при старте."""
+    global REFERRALS
+    if REFERRALS:
+        return
+    try:
+        if os.path.exists(REFERRALS_FILE):
+            data = _read_json_file(REFERRALS_FILE)
+            if isinstance(data, dict):
+                REFERRALS = data
+                return
+    except Exception as e:
+        logger.warning(f"Не удалось загрузить реферальные данные: {e}")
+    REFERRALS = {}
+
+
+def _save_referrals() -> None:
+    """Сохраняем реферальные данные на диск."""
+    try:
+        _save_json_file(REFERRALS_FILE, REFERRALS)
+    except Exception as e:
+        logger.warning(f"Не удалось сохранить реферальные данные: {e}")
+
+
+def _get_or_create_ref_user(user_id: int | str) -> dict:
+    """Возвращает (и при необходимости создаёт) реферальную запись пользователя."""
+    _load_referrals()
+    uid = str(user_id)
+    if uid not in REFERRALS:
+        REFERRALS[uid] = {
+            "parent1": None,
+            "parent2": None,
+            "parent3": None,
+            "referrals_l1": [],
+            "referrals_l2": [],
+            "referrals_l3": [],
+            "earned_rub": 0.0,
+            "volume_rub": 0.0,
+        }
+    return REFERRALS[uid]
+
+
+def _process_referral_start(user_id: int, start_text: str | None) -> None:
+    """
+    Обработка /start с параметром вида `ref_<id>`.
+    Прописываем трёхуровневую иерархию: parent1/2/3 + списки рефералов.
+    """
+    if not start_text:
+        return
+    try:
+        parts = (start_text or "").strip().split(maxsplit=1)
+        if len(parts) < 2:
+            return
+        arg = parts[1].strip()
+        if not arg.startswith("ref_"):
+            return
+        inviter_raw = arg[4:].strip()
+        if not inviter_raw:
+            return
+        inviter_id = int(inviter_raw)
+    except Exception:
+        return
+
+    if inviter_id == user_id:
+        # Нельзя приглашать самого себя
+        return
+
+    # Загружаем/создаём записи
+    _load_referrals()
+    u = _get_or_create_ref_user(user_id)
+
+    # Если уже есть parent1 — не переписываем привязку
+    if u.get("parent1"):
+        return
+
+    inviter = _get_or_create_ref_user(inviter_id)
+    parent1 = str(inviter_id)
+    parent2 = inviter.get("parent1")
+    parent3 = inviter.get("parent2")
+
+    uid_str = str(user_id)
+    u["parent1"] = parent1
+    u["parent2"] = parent2
+    u["parent3"] = parent3
+
+    # Добавляем в списки рефералов уровней
+    if uid_str not in inviter["referrals_l1"]:
+        inviter["referrals_l1"].append(uid_str)
+
+    if parent2:
+        p2 = _get_or_create_ref_user(parent2)
+        if uid_str not in p2["referrals_l2"]:
+            p2["referrals_l2"].append(uid_str)
+
+    if parent3:
+        p3 = _get_or_create_ref_user(parent3)
+        if uid_str not in p3["referrals_l3"]:
+            p3["referrals_l3"].append(uid_str)
+
+    _save_referrals()
 
 TELEGRAM_API_ID = int(os.getenv("TELEGRAM_API_ID", "0") or "0")
 TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH", "") or ""
@@ -597,6 +722,12 @@ async def cmd_start(message: types.Message, state: FSMContext):
         })
     else:
         db.update_user_activity(user.id)
+
+    # Обработка реферального старта: /start ref_<id>
+    try:
+        _process_referral_start(user.id, message.text or "")
+    except Exception as e:
+        logger.warning(f"Ошибка обработки реферального старта /start: {e}")
 
     username_display = user.username and f"@{user.username}" or user.first_name or "друг"
 
@@ -1740,6 +1871,207 @@ def setup_http_server():
 
     app.router.add_post("/api/ton/notify", ton_notify_handler)
     app.router.add_route("OPTIONS", "/api/ton/notify", lambda r: Response(status=204, headers=_cors_headers()))
+
+    # ======== РЕФЕРАЛЬНАЯ СИСТЕМА (API) ========
+
+    async def referral_purchase_handler(request):
+        """
+        Начисление реферального дохода с покупки пользователя.
+        JSON: { "user_id": "...", "amount_rub": 123.45 }
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            return _json_response({"error": "bad_request", "message": "Invalid JSON"}, status=400)
+
+        user_id = body.get("user_id")
+        amount_rub = body.get("amount_rub") or body.get("amount")
+        try:
+            if user_id is None:
+                raise ValueError("user_id required")
+            uid = str(int(str(user_id).strip()))
+            amount = float(amount_rub or 0)
+        except Exception:
+            return _json_response({"error": "bad_request", "message": "user_id(int) и amount_rub(number) обязательны"}, status=400)
+
+        if amount <= 0:
+            return _json_response({"error": "bad_request", "message": "amount_rub должен быть > 0"}, status=400)
+
+        # Обновляем объёмы и доходы по цепочке 1–3 уровень
+        _load_referrals()
+        user_ref = _get_or_create_ref_user(uid)
+        parent1 = user_ref.get("parent1")
+        parent2 = user_ref.get("parent2")
+        parent3 = user_ref.get("parent3")
+
+        # Пользователь сам объёмом рефералов не считается, объём идёт наверх
+        for pid, percent in (
+            (parent1, 0.15),
+            (parent2, 0.20),
+            (parent3, 0.25),
+        ):
+            if not pid:
+                continue
+            pref = _get_or_create_ref_user(pid)
+            pref["volume_rub"] = float(pref.get("volume_rub") or 0.0) + amount
+            bonus = amount * percent
+            pref["earned_rub"] = float(pref.get("earned_rub") or 0.0) + bonus
+
+        _save_referrals()
+        return _json_response({"success": True})
+
+    app.router.add_post("/api/referral/purchase", referral_purchase_handler)
+    app.router.add_route("OPTIONS", "/api/referral/purchase", lambda r: Response(status=204, headers=_cors_headers()))
+
+    async def referral_stats_handler(request):
+        """
+        Статистика реферальной программы для пользователя.
+        GET /api/referral/stats?user_id=...
+        """
+        user_id = request.rel_url.query.get("user_id", "").strip()
+        if not user_id:
+            return _json_response({"error": "bad_request", "message": "user_id required"}, status=400)
+        try:
+            uid = str(int(user_id))
+        except Exception:
+            uid = str(user_id)
+
+        _load_referrals()
+        ref = _get_or_create_ref_user(uid)
+
+        # Подсчитываем количество рефералов по уровням
+        lvl1 = len(ref.get("referrals_l1") or [])
+        lvl2 = len(ref.get("referrals_l2") or [])
+        lvl3 = len(ref.get("referrals_l3") or [])
+        total_refs = lvl1 + lvl2 + lvl3
+
+        earned_rub = float(ref.get("earned_rub") or 0.0)
+        volume_rub = float(ref.get("volume_rub") or 0.0)
+
+        # Курс TON (RUB за 1 TON)
+        ton_rate = await _get_ton_rate_rub()
+        if ton_rate <= 0:
+            ton_rate = 600.0
+        earned_ton = round(earned_rub / ton_rate, 6) if earned_rub > 0 else 0.0
+        volume_ton = round(volume_rub / ton_rate, 6) if volume_rub > 0 else 0.0
+
+        # Уровни JetRefs по объёму в TON:
+        # 1 уровень: 0–4999.99 TON
+        # 2 уровень: 5000–14999.99 TON
+        # 3 уровень: 15000+ TON
+        L2_TON = 5000.0
+        L3_TON = 15000.0
+        max_level = 3
+        if volume_ton >= L3_TON:
+            level = 3
+            progress_percent = 100
+            to_next_volume_rub = 0.0
+        else:
+            if volume_ton >= L2_TON:
+                level = 2
+                base = L2_TON
+                target = L3_TON
+            else:
+                level = 1
+                base = 0.0
+                target = L2_TON
+            span = max(1.0, target - base)
+            done = max(0.0, volume_ton - base)
+            progress_percent = int(round(min(1.0, done / span) * 100))
+            remaining_ton = max(0.0, target - volume_ton)
+            to_next_volume_rub = remaining_ton * ton_rate
+
+        payload = {
+            "user_id": uid,
+            "earned_rub": round(earned_rub, 2),
+            "earned_ton": earned_ton,
+            "volume_rub": round(volume_rub, 2),
+            "volume_ton": volume_ton,
+            "referrals_level1": lvl1,
+            "referrals_level2": lvl2,
+            "referrals_level3": lvl3,
+            "total_referrals": total_refs,
+            "level": level,
+            "max_level": max_level,
+            "progress_percent": progress_percent,
+            "to_next_volume_rub": round(to_next_volume_rub, 2),
+            "ton_rate_rub": ton_rate,
+        }
+        return _json_response(payload)
+
+    app.router.add_get("/api/referral/stats", referral_stats_handler)
+    app.router.add_route("OPTIONS", "/api/referral/stats", lambda r: Response(status=204, headers=_cors_headers()))
+
+    async def referral_withdraw_handler(request):
+        """
+        Создание заявки на вывод реферальных средств.
+        JSON: { "user_id", "amount_rub", "method", "details" }
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            return _json_response({"error": "bad_request", "message": "Invalid JSON"}, status=400)
+
+        user_id = body.get("user_id")
+        amount_rub = body.get("amount_rub") or body.get("amount")
+        method = (body.get("method") or "").strip()
+        details = (body.get("details") or "").strip()
+
+        try:
+            if user_id is None:
+                raise ValueError("user_id required")
+            uid = str(int(str(user_id).strip()))
+            amount = float(amount_rub or 0)
+        except Exception:
+            return _json_response({"error": "bad_request", "message": "user_id(int) и amount_rub(number) обязательны"}, status=400)
+
+        if amount <= 0:
+            return _json_response({"error": "bad_request", "message": "amount_rub должен быть > 0"}, status=400)
+
+        _load_referrals()
+        ref = _get_or_create_ref_user(uid)
+        current_balance = float(ref.get("earned_rub") or 0.0)
+        if amount > current_balance + 1e-6:
+            return _json_response(
+                {"error": "insufficient_funds", "message": "Недостаточно реферальных средств", "current_balance_rub": round(current_balance, 2)},
+                status=400,
+            )
+
+        ref["earned_rub"] = current_balance - amount
+        _save_referrals()
+
+        # Пытаемся отправить уведомление в рабочую группу
+        if REFERRAL_WITHDRAW_CHAT_ID:
+            try:
+                # Получаем пользователя через бота (чтоб взять username / имя)
+                try:
+                    tg_user = await bot.get_chat(int(uid))
+                except Exception:
+                    tg_user = None
+                username = getattr(tg_user, "username", None) if tg_user else None
+                first_name = getattr(tg_user, "first_name", None) if tg_user else None
+                last_name = getattr(tg_user, "last_name", None) if tg_user else None
+                line = username and f"@{username}" or (first_name or "") + (" " + last_name if last_name else "")
+                if not line:
+                    line = uid
+
+                text = (
+                    "💸 <b>Новая заявка на вывод реферальных средств</b>\n\n"
+                    f"Пользователь: {line}\n"
+                    f"ID: <code>{uid}</code>\n"
+                    f"Сумма вывода: <b>{amount:.2f} ₽</b>\n"
+                    f"Метод: <b>{method or 'не указан'}</b>\n"
+                    f"Реквизиты:\n<code>{details or 'не указаны'}</code>\n\n"
+                    f"Остаток по реф.балансу: <b>{ref['earned_rub']:.2f} ₽</b>"
+                )
+                await bot.send_message(REFERRAL_WITHDRAW_CHAT_ID, text, parse_mode="HTML")
+            except Exception as e:
+                logger.error(f"Не удалось отправить заявку на вывод реферальных средств: {e}")
+
+        return _json_response({"success": True, "new_balance_rub": round(ref["earned_rub"], 2)})
+
+    app.router.add_post("/api/referral/withdraw", referral_withdraw_handler)
+    app.router.add_route("OPTIONS", "/api/referral/withdraw", lambda r: Response(status=204, headers=_cors_headers()))
 
     # Продажа звёзд из мини-приложения: создать счёт XTR и сохранить данные выплаты
     async def sellstars_create_invoice_handler(request):
