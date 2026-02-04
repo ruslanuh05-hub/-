@@ -5,8 +5,10 @@ import os
 import re
 import base64
 import time
+import uuid
 from io import BytesIO
 from datetime import datetime
+from typing import Optional, Union
 from aiohttp import web
 from aiohttp.web import Response
 import aiohttp
@@ -44,9 +46,26 @@ ADM_WEB_APP_URL = os.getenv("ADM_WEB_APP_URL", "https://jetstoreapp.ru/html/admi
 
 # Группа/чат, куда слать уведомления о продаже звёзд
 SELL_STARS_NOTIFY_CHAT_ID = int(os.getenv("SELL_STARS_NOTIFY_CHAT_ID", "0") or "0")
+TON_NOTIFY_CHAT_ID = int(os.getenv("TON_NOTIFY_CHAT_ID", "0") or "0")
 
 # Курс выплаты за 1 звезду (RUB), используем тот же, что в мини-аппе
 STAR_BUY_RATE_RUB = float(os.getenv("STAR_BUY_RATE_RUB", "0.65") or "0.65")
+
+# Заказы на продажу звёзд из мини-приложения: order_id -> { user_id, username, first_name, last_name, stars_amount, method, payout_* }
+# После successful_payment по payload "sell_stars:order_id" отправляем уведомление и удаляем запись
+PENDING_SELL_STARS_ORDERS: dict[str, dict] = {}
+
+# Реферальная система
+# referrals_data.json: user_id(str) -> {
+#   "parent1": str|None, "parent2": str|None, "parent3": str|None,
+#   "referrals_l1": [str], "referrals_l2": [str], "referrals_l3": [str],
+#   "earned_rub": float, "volume_rub": float
+# }
+REFERRALS: dict[str, dict] = {}
+REFERRALS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "referrals_data.json")
+
+# Чат, куда слать заявки на вывод реферальных средств
+REFERRAL_WITHDRAW_CHAT_ID = int(os.getenv("REFERRAL_WITHDRAW_CHAT_ID", "0") or "0")
 
 # ============ USERBOT (Telethon / MTProto) ============
 # Чтобы искать любого пользователя по @username без /start, нужен userbot:
@@ -63,6 +82,120 @@ def _read_json_file(path: str) -> dict:
     except Exception as e:
         logger.warning(f"Не удалось прочитать JSON {path}: {e}")
     return {}
+
+
+def _save_json_file(path: str, data: dict) -> None:
+    """Безопасная запись JSON на диск."""
+    try:
+        tmp_path = path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, path)
+    except Exception as e:
+        logger.warning(f"Не удалось сохранить JSON {path}: {e}")
+
+
+def _load_referrals() -> None:
+    """Загружаем реферальные данные из файла один раз при старте."""
+    global REFERRALS
+    if REFERRALS:
+        return
+    try:
+        if os.path.exists(REFERRALS_FILE):
+            data = _read_json_file(REFERRALS_FILE)
+            if isinstance(data, dict):
+                REFERRALS = data
+                return
+    except Exception as e:
+        logger.warning(f"Не удалось загрузить реферальные данные: {e}")
+    REFERRALS = {}
+
+
+def _save_referrals() -> None:
+    """Сохраняем реферальные данные на диск."""
+    try:
+        _save_json_file(REFERRALS_FILE, REFERRALS)
+    except Exception as e:
+        logger.warning(f"Не удалось сохранить реферальные данные: {e}")
+
+
+def _get_or_create_ref_user(user_id: int | str) -> dict:
+    """Возвращает (и при необходимости создаёт) реферальную запись пользователя."""
+    _load_referrals()
+    uid = str(user_id)
+    if uid not in REFERRALS:
+        REFERRALS[uid] = {
+            "parent1": None,
+            "parent2": None,
+            "parent3": None,
+            "referrals_l1": [],
+            "referrals_l2": [],
+            "referrals_l3": [],
+            "earned_rub": 0.0,
+            "volume_rub": 0.0,
+        }
+    return REFERRALS[uid]
+
+
+def _process_referral_start(user_id: int, start_text: str | None) -> Optional[int]:
+    """
+    Обработка /start с параметром вида `ref_<id>`.
+    Прописываем трёхуровневую иерархию: parent1/2/3 + списки рефералов.
+    """
+    if not start_text:
+        return None
+    try:
+        parts = (start_text or "").strip().split(maxsplit=1)
+        if len(parts) < 2:
+            return None
+        arg = parts[1].strip()
+        if not arg.startswith("ref_"):
+            return
+        inviter_raw = arg[4:].strip()
+        if not inviter_raw:
+            return None
+        inviter_id = int(inviter_raw)
+    except Exception:
+        return None
+
+    if inviter_id == user_id:
+        # Нельзя приглашать самого себя
+        return None
+
+    # Загружаем/создаём записи
+    _load_referrals()
+    u = _get_or_create_ref_user(user_id)
+
+    # Если уже есть parent1 — не переписываем привязку
+    if u.get("parent1"):
+        return None
+
+    inviter = _get_or_create_ref_user(inviter_id)
+    parent1 = str(inviter_id)
+    parent2 = inviter.get("parent1")
+    parent3 = inviter.get("parent2")
+
+    uid_str = str(user_id)
+    u["parent1"] = parent1
+    u["parent2"] = parent2
+    u["parent3"] = parent3
+
+    # Добавляем в списки рефералов уровней
+    if uid_str not in inviter["referrals_l1"]:
+        inviter["referrals_l1"].append(uid_str)
+
+    if parent2:
+        p2 = _get_or_create_ref_user(parent2)
+        if uid_str not in p2["referrals_l2"]:
+            p2["referrals_l2"].append(uid_str)
+
+    if parent3:
+        p3 = _get_or_create_ref_user(parent3)
+        if uid_str not in p3["referrals_l3"]:
+            p3["referrals_l3"].append(uid_str)
+
+    _save_referrals()
+    return inviter_id
 
 TELEGRAM_API_ID = int(os.getenv("TELEGRAM_API_ID", "0") or "0")
 TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH", "") or ""
@@ -132,7 +265,7 @@ DONATEHUB_USERNAME = _get_env_clean("DONATEHUB_USERNAME") or _donatehub_cfg_get(
 DONATEHUB_PASSWORD = _get_env_clean("DONATEHUB_PASSWORD") or _donatehub_cfg_get("password", "")
 DONATEHUB_2FA_CODE = _get_env_clean("DONATEHUB_2FA_CODE") or _donatehub_cfg_get("code", "")
 
-_donatehub_token: str | None = None
+_donatehub_token: Optional[str] = None
 _donatehub_token_ts: float = 0.0
 
 def _cors_headers():
@@ -142,7 +275,7 @@ def _cors_headers():
         "Access-Control-Allow-Headers": "*",
     }
 
-def _json_response(payload: dict | list, status: int = 200):
+def _json_response(payload: Union[dict, list], status: int = 200):
     return Response(
         text=json.dumps(payload, ensure_ascii=False),
         status=status,
@@ -217,7 +350,7 @@ async def _convert_to_usd(amount_local: float, currency: str) -> tuple[float, di
     amount_usd = round(float(amount_local) / rate, 2)
     return amount_usd, {"currency": currency, "rate": rate, "course": course}
 
-telethon_client: TelegramClient | None = None
+telethon_client: Optional[TelegramClient] = None
 
 # простой кэш: username -> (ts, payload)
 _tg_lookup_cache: dict[str, tuple[float, dict]] = {}
@@ -390,7 +523,7 @@ def _data_url_from_bytes(image_bytes: bytes) -> str:
     b64 = base64.b64encode(image_bytes).decode("ascii")
     return f"data:image/jpeg;base64,{b64}"
 
-async def lookup_user_via_telethon(username: str) -> dict | None:
+async def lookup_user_via_telethon(username: str) -> Optional[dict]:
     """Возвращает {username, firstName, lastName, avatar} для любого @username через userbot."""
     global telethon_client
     if not telethon_client:
@@ -591,6 +724,29 @@ async def cmd_start(message: types.Message, state: FSMContext):
     else:
         db.update_user_activity(user.id)
 
+    # Обработка реферального старта: /start ref_<id>
+    inviter_id: Optional[int] = None
+    try:
+        inviter_id = _process_referral_start(user.id, message.text or "")
+    except Exception as e:
+        logger.warning(f"Ошибка обработки реферального старта /start: {e}")
+
+    # ТЕСТОВОЕ уведомление пригласившему о новом реферале
+    if inviter_id:
+        try:
+            inviter_chat_id = int(inviter_id)
+            ref_user = message.from_user
+            ref_line = ref_user.username and f"@{ref_user.username}" or (ref_user.full_name or str(ref_user.id))
+            text = (
+                "👥 <b>Новый реферал (тестовое уведомление)</b>\n\n"
+                f"Пользователь: {ref_line}\n"
+                f"ID: <code>{ref_user.id}</code>\n"
+                "Перешёл по вашей реферальной ссылке."
+            )
+            await bot.send_message(inviter_chat_id, text, parse_mode="HTML")
+        except Exception as e:
+            logger.warning(f"Не удалось отправить тестовое уведомление о реферале пригласившему {inviter_id}: {e}")
+
     username_display = user.username and f"@{user.username}" or user.first_name or "друг"
 
     text = (
@@ -692,8 +848,49 @@ async def process_successful_payment(message: types.Message):
 
     payload = sp.invoice_payload or ""
     user = message.from_user
-    
-    # Продажа звёзд (sellstars:amount)
+
+    # Продажа звёзд из мини-приложения (sell_stars:order_id) — есть данные выплаты
+    if payload.startswith("sell_stars:"):
+        order_id = payload.split(":", 1)[1].strip()
+        order = PENDING_SELL_STARS_ORDERS.pop(order_id, None)
+        stars = sp.total_amount
+        payout_rub = stars * STAR_BUY_RATE_RUB
+        seller_username = f"@{user.username}" if user.username else (user.full_name or str(user.id))
+
+        notify_text = (
+            "‼️ <b>Новая продажа звёзд</b>\n\n"
+            f"Продавец: {seller_username}\n"
+            f"ID: <code>{user.id}</code>\n"
+            f"Имя: {user.first_name or ''} {user.last_name or ''}\n"
+            f"Продано звёзд: <b>{stars}</b> ⭐\n"
+            f"Сумма выплаты: <b>{payout_rub:.2f} ₽</b>\n"
+        )
+        if order:
+            method = order.get("method") or "wallet"
+            notify_text += "\n<b>Выплата:</b> "
+            if method == "wallet":
+                notify_text += f"Кошелёк\nАдрес: <code>{order.get('wallet_address') or '—'}</code>\n"
+                if order.get("wallet_memo"):
+                    notify_text += f"Memo: <code>{order['wallet_memo']}</code>\n"
+            elif method == "sbp":
+                notify_text += f"СБП\nТелефон: <code>{order.get('sbp_phone') or '—'}</code>\nБанк: {order.get('sbp_bank') or '—'}\n"
+            elif method == "card":
+                notify_text += f"Карта\nНомер: <code>{order.get('card_number') or '—'}</code>\nБанк: {order.get('card_bank') or '—'}\n"
+
+        await message.answer(
+            "✅ Оплата звёздами получена!\n\n"
+            f"Мы выплатим тебе примерно <b>{payout_rub:.2f} ₽</b> за {stars} ⭐.\n"
+            "Ожидай обработки заявки.",
+            parse_mode="HTML"
+        )
+        if SELL_STARS_NOTIFY_CHAT_ID:
+            try:
+                await bot.send_message(SELL_STARS_NOTIFY_CHAT_ID, notify_text, parse_mode="HTML")
+            except Exception as e:
+                logger.error(f"Не удалось отправить уведомление о продаже звёзд: {e}")
+        return
+
+    # Продажа звёзд из чата (sellstars:amount) — без данных выплаты
     if payload.startswith("sellstars:"):
         try:
             stars = int(payload.split(":", 1)[1])
@@ -711,7 +908,6 @@ async def process_successful_payment(message: types.Message):
             f"Сумма выплаты: <b>{payout_rub:.2f} ₽</b>\n"
         )
 
-        # Уведомление пользователю
         await message.answer(
             "✅ Оплата звёздами получена!\n\n"
             f"Мы выплатим тебе примерно <b>{payout_rub:.2f} ₽</b> за {stars} ⭐.\n"
@@ -719,7 +915,6 @@ async def process_successful_payment(message: types.Message):
             parse_mode="HTML"
         )
 
-        # Уведомление в группу/канал (если задан CHAT_ID)
         if SELL_STARS_NOTIFY_CHAT_ID:
             try:
                 await bot.send_message(SELL_STARS_NOTIFY_CHAT_ID, notify_text, parse_mode="HTML")
@@ -1462,8 +1657,14 @@ def setup_http_server():
             )
 
     app = web.Application(middlewares=[error_middleware])
-    # Хранилище оплаченных заказов Fragment (заполняется вебхуком order.completed)
-    app["fragment_completed_orders"] = set()
+    # Хранилище заказов Fragment.com (через сайт fragment.com/api по cookies+hash)
+    # Заказы Fragment.com (через сайт fragment.com/api по cookies+hash)
+    # order_id -> meta (type, recipient, quantity, created_at)
+    app["fragment_site_orders"] = {}
+    # TON-оплата через Tonkeeper: order_id -> { amount_nanoton, amount_ton, amount_rub, purchase, user_id, created_at }
+    app["ton_orders"] = {}
+    # event_id уже использованных входящих TON-переводов (при проверке по сумме без комментария)
+    app["ton_verified_event_ids"] = set()
     # Preflight для CORS
     app.router.add_route('OPTIONS', '/api/telegram/user', lambda r: Response(status=204, headers={
         'Access-Control-Allow-Origin': '*',
@@ -1476,19 +1677,28 @@ def setup_http_server():
 
     app.router.add_get('/api/telegram/user', get_telegram_user_handler)
 
+    CRYPTOBOT_USDT_AMOUNT = float(os.getenv("CRYPTOBOT_USDT_AMOUNT", "1") or "1")
+
     async def api_config_handler(request):
-        """Публичная конфигурация для фронтенда (бот, домен)"""
+        """Публичная конфигурация для фронтенда (бот, домен, CryptoBot USDT)"""
         try:
             me = await bot.get_me()
             bot_username = me.username or "JetStoreApp_bot"
-            return _json_response({
+            cfg = {
                 "bot_username": bot_username,
                 "web_app_url": WEB_APP_URL,
-                "domain": "jetstoreapp.ru"
-            })
+                "domain": "jetstoreapp.ru",
+                "cryptobot_usdt_amount": CRYPTOBOT_USDT_AMOUNT,
+            }
+            return _json_response(cfg)
         except Exception as e:
             logger.error(f"/api/config error: {e}")
-            return _json_response({"bot_username": "JetStoreApp_bot", "web_app_url": WEB_APP_URL, "domain": "jetstoreapp.ru"})
+            return _json_response({
+                "bot_username": "JetStoreApp_bot",
+                "web_app_url": WEB_APP_URL,
+                "domain": "jetstoreapp.ru",
+                "cryptobot_usdt_amount": CRYPTOBOT_USDT_AMOUNT,
+            })
 
     app.router.add_get('/api/config', api_config_handler)
 
@@ -1511,6 +1721,485 @@ def setup_http_server():
 
     app.router.add_get('/api/ton-rate', ton_rate_handler)
     app.router.add_route('OPTIONS', '/api/ton-rate', lambda r: Response(status=204, headers=_cors_headers()))
+
+    TON_PAYMENT_ADDRESS = {"value": (os.getenv("TON_PAYMENT_ADDRESS") or "").strip()}
+
+    async def _get_ton_rate_rub() -> float:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get("https://api.coinpaprika.com/v1/tickers/ton-toncoin?quotes=RUB") as resp:
+                    data = await resp.json(content_type=None) if resp.content_type else {}
+            if data and data.get("quotes") and data["quotes"].get("RUB"):
+                p = float(data["quotes"]["RUB"].get("price", 0) or 0)
+                if p > 0:
+                    return round(p, 2)
+        except Exception as e:
+            logger.warning(f"TON rate for create-order: {e}")
+        return 600.0
+
+    async def ton_create_order_handler(request):
+        addr = TON_PAYMENT_ADDRESS.get("value") or ""
+        if not addr:
+            return _json_response({"error": "not_configured", "message": "TON_PAYMENT_ADDRESS не задан"}, status=503)
+        # Нормализуем адрес: TON Connect требует user-friendly адрес (EQ.../UQ...), raw 0:... не подходит.
+        addr = str(addr).strip()
+        # Если случайно передали ссылку ton://transfer/... — вытащим адрес.
+        if addr.startswith("ton://transfer/"):
+            addr = addr[len("ton://transfer/") :]
+            addr = addr.split("?")[0].strip()
+        if addr.startswith("https://") and "/transfer/" in addr:
+            # Tonkeeper transfer link format: https://app.tonkeeper.com/transfer/<addr>?amount=...
+            try:
+                addr = addr.split("/transfer/", 1)[1].split("?", 1)[0].strip()
+            except Exception:
+                pass
+        # raw → user-friendly через TonCenter
+        if re.match(r"^(-1|0):[0-9a-fA-F]{32,64}$", addr):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        "https://toncenter.com/api/v2/packAddress",
+                        params={"address": addr}
+                    ) as resp:
+                        data = await resp.json(content_type=None) if resp.content_type else {}
+                packed = data.get("result") if isinstance(data, dict) and data.get("ok") else None
+                if packed:
+                    addr = str(packed).strip()
+            except Exception as e:
+                logger.warning(f"TON_PAYMENT_ADDRESS packAddress error: {e}")
+        # Валидация: base64url 48 символов, обычно начинается с EQ/UQ
+        if not re.match(r"^[A-Za-z0-9_-]{48}$", addr) or not (addr.startswith("EQ") or addr.startswith("UQ")):
+            return _json_response({
+                "error": "bad_config",
+                "message": "TON_PAYMENT_ADDRESS должен быть user-friendly адресом вида EQ.../UQ... (48 символов) или raw 0:... (он будет упакован автоматически)"
+            }, status=503)
+        try:
+            body = await request.json()
+        except Exception:
+            return _json_response({"error": "bad_request", "message": "Invalid JSON"}, status=400)
+        amount_rub = float(body.get("amount_rub") or body.get("amount") or 0)
+        if amount_rub <= 0:
+            return _json_response({"error": "bad_request", "message": "amount_rub должен быть > 0"}, status=400)
+        rate = await _get_ton_rate_rub()
+        amount_ton = round(amount_rub / rate, 4)
+        if amount_ton <= 0:
+            return _json_response({"error": "bad_request", "message": "Сумма в TON слишком мала"}, status=400)
+        amount_nanoton = int(round(amount_ton * 1e9))
+        import uuid
+        order_id = str(uuid.uuid4()).replace("-", "")[:24]
+        purchase = body.get("purchase") or {}
+        user_id = body.get("user_id") or (purchase.get("userId") if isinstance(purchase.get("userId"), str) else None) or "unknown"
+        ton_orders = request.app.get("ton_orders") or {}
+        ton_orders[order_id] = {
+            "amount_nanoton": amount_nanoton,
+            "amount_ton": amount_ton,
+            "amount_rub": amount_rub,
+            "purchase": purchase,
+            "user_id": user_id,
+            "created_at": time.time(),
+        }
+        request.app["ton_orders"] = ton_orders
+        comment = order_id
+        return _json_response({
+            "success": True,
+            "order_id": order_id,
+            "payment_address": addr,
+            "amount_ton": amount_ton,
+            "amount_nanoton": amount_nanoton,
+            "comment": comment,
+            "ton_rate_rub": rate,
+        })
+
+    app.router.add_post("/api/ton/create-order", ton_create_order_handler)
+    app.router.add_route("OPTIONS", "/api/ton/create-order", lambda r: Response(status=204, headers=_cors_headers()))
+
+    async def ton_notify_handler(request):
+        """Уведомление в рабочую группу о заявке на покупку TON (ручная обработка)."""
+        if not TON_NOTIFY_CHAT_ID:
+            return _json_response({"error": "not_configured", "message": "TON_NOTIFY_CHAT_ID не задан"}, status=503)
+        try:
+            body = await request.json()
+        except Exception:
+            return _json_response({"error": "bad_request", "message": "Invalid JSON"}, status=400)
+
+        purchase = body.get("purchase") or {}
+        method = (body.get("method") or "").strip()
+        total_rub = body.get("total_rub") or body.get("totalAmount") or 0
+        base_rub = body.get("base_rub") or body.get("baseAmount") or 0
+        invoice_id = body.get("invoice_id") or None
+        order_id = body.get("order_id") or None
+        buyer = body.get("buyer") or {}
+
+        wallet = (purchase.get("wallet") or "").strip()
+        network = (purchase.get("network") or "").strip()
+        ton_amount = purchase.get("ton_amount") or purchase.get("tonAmount") or purchase.get("amount_ton") or 0
+
+        if not wallet or not network or not ton_amount:
+            return _json_response({"error": "bad_request", "message": "wallet, network, ton_amount обязательны"}, status=400)
+
+        try:
+            ton_amount = float(ton_amount)
+        except Exception:
+            ton_amount = 0
+        if ton_amount <= 0:
+            return _json_response({"error": "bad_request", "message": "ton_amount должен быть > 0"}, status=400)
+
+        try:
+            total_rub = float(total_rub or 0)
+        except Exception:
+            total_rub = 0.0
+        try:
+            base_rub = float(base_rub or 0)
+        except Exception:
+            base_rub = 0.0
+
+        buyer_id = (buyer.get("id") or buyer.get("user_id") or buyer.get("userId") or "").strip()
+        buyer_username = buyer.get("username") or ""
+        buyer_name = " ".join([str(buyer.get("first_name") or "").strip(), str(buyer.get("last_name") or "").strip()]).strip()
+        buyer_line = ""
+        if buyer_username:
+            buyer_line = f"@{buyer_username}"
+        elif buyer_name:
+            buyer_line = buyer_name
+        elif buyer_id:
+            buyer_line = buyer_id
+        else:
+            buyer_line = "—"
+
+        text = (
+            "🟦 <b>Заявка: покупка TON</b>\n\n"
+            f"Покупатель: {buyer_line}\n"
+            + (f"ID: <code>{buyer_id}</code>\n" if buyer_id else "")
+            + f"Сеть: <b>{network}</b>\n"
+            + f"Кошелёк: <code>{wallet}</code>\n"
+            + f"TON: <b>{ton_amount}</b>\n"
+            + f"Оплата: <b>{total_rub:.2f} ₽</b>\n"
+            + (f"Метод: <b>{method}</b>\n" if method else "")
+            + (f"invoice_id: <code>{invoice_id}</code>\n" if invoice_id else "")
+            + (f"order_id: <code>{order_id}</code>\n" if order_id else "")
+        )
+
+        try:
+            await bot.send_message(TON_NOTIFY_CHAT_ID, text, parse_mode="HTML")
+        except Exception as e:
+            logger.error(f"TON notify send failed (chat={TON_NOTIFY_CHAT_ID}): {e}")
+            return _json_response({"success": False, "error": "send_failed", "message": "Не удалось отправить уведомление в группу"}, status=502)
+
+        return _json_response({"success": True})
+
+    app.router.add_post("/api/ton/notify", ton_notify_handler)
+    app.router.add_route("OPTIONS", "/api/ton/notify", lambda r: Response(status=204, headers=_cors_headers()))
+
+    # ======== РЕФЕРАЛЬНАЯ СИСТЕМА (API) ========
+
+    async def referral_purchase_handler(request):
+        """
+        Начисление реферального дохода с покупки пользователя.
+        JSON: { "user_id": "...", "amount_rub": 123.45 }
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            return _json_response({"error": "bad_request", "message": "Invalid JSON"}, status=400)
+
+        user_id = body.get("user_id")
+        amount_rub = body.get("amount_rub") or body.get("amount")
+        try:
+            if user_id is None:
+                raise ValueError("user_id required")
+            uid = str(int(str(user_id).strip()))
+            amount = float(amount_rub or 0)
+        except Exception:
+            return _json_response({"error": "bad_request", "message": "user_id(int) и amount_rub(number) обязательны"}, status=400)
+
+        if amount <= 0:
+            return _json_response({"error": "bad_request", "message": "amount_rub должен быть > 0"}, status=400)
+
+        # Обновляем объёмы и доходы по цепочке 1–3 уровень
+        _load_referrals()
+        user_ref = _get_or_create_ref_user(uid)
+        parent1 = user_ref.get("parent1")
+        parent2 = user_ref.get("parent2")
+        parent3 = user_ref.get("parent3")
+
+        # Пользователь сам объёмом рефералов не считается, объём идёт наверх
+        for pid, percent in (
+            (parent1, 0.15),
+            (parent2, 0.20),
+            (parent3, 0.25),
+        ):
+            if not pid:
+                continue
+            pref = _get_or_create_ref_user(pid)
+            pref["volume_rub"] = float(pref.get("volume_rub") or 0.0) + amount
+            bonus = amount * percent
+            pref["earned_rub"] = float(pref.get("earned_rub") or 0.0) + bonus
+
+        _save_referrals()
+        return _json_response({"success": True})
+
+    app.router.add_post("/api/referral/purchase", referral_purchase_handler)
+    app.router.add_route("OPTIONS", "/api/referral/purchase", lambda r: Response(status=204, headers=_cors_headers()))
+
+    async def referral_stats_handler(request):
+        """
+        Статистика реферальной программы для пользователя.
+        GET /api/referral/stats?user_id=...
+        """
+        user_id = request.rel_url.query.get("user_id", "").strip()
+        if not user_id:
+            return _json_response({"error": "bad_request", "message": "user_id required"}, status=400)
+        try:
+            uid = str(int(user_id))
+        except Exception:
+            uid = str(user_id)
+
+        _load_referrals()
+        ref = _get_or_create_ref_user(uid)
+
+        # Подсчитываем количество рефералов по уровням
+        lvl1 = len(ref.get("referrals_l1") or [])
+        lvl2 = len(ref.get("referrals_l2") or [])
+        lvl3 = len(ref.get("referrals_l3") or [])
+        total_refs = lvl1 + lvl2 + lvl3
+
+        earned_rub = float(ref.get("earned_rub") or 0.0)
+        volume_rub = float(ref.get("volume_rub") or 0.0)
+
+        # Курс TON (RUB за 1 TON)
+        ton_rate = await _get_ton_rate_rub()
+        if ton_rate <= 0:
+            ton_rate = 600.0
+        earned_ton = round(earned_rub / ton_rate, 6) if earned_rub > 0 else 0.0
+        volume_ton = round(volume_rub / ton_rate, 6) if volume_rub > 0 else 0.0
+
+        # Уровни JetRefs по объёму в TON:
+        # 1 уровень: 0–4999.99 TON
+        # 2 уровень: 5000–14999.99 TON
+        # 3 уровень: 15000+ TON
+        L2_TON = 5000.0
+        L3_TON = 15000.0
+        max_level = 3
+        if volume_ton >= L3_TON:
+            level = 3
+            progress_percent = 100
+            to_next_volume_rub = 0.0
+        else:
+            if volume_ton >= L2_TON:
+                level = 2
+                base = L2_TON
+                target = L3_TON
+            else:
+                level = 1
+                base = 0.0
+                target = L2_TON
+            span = max(1.0, target - base)
+            done = max(0.0, volume_ton - base)
+            progress_percent = int(round(min(1.0, done / span) * 100))
+            remaining_ton = max(0.0, target - volume_ton)
+            to_next_volume_rub = remaining_ton * ton_rate
+
+        payload = {
+            "user_id": uid,
+            "earned_rub": round(earned_rub, 2),
+            "earned_ton": earned_ton,
+            "volume_rub": round(volume_rub, 2),
+            "volume_ton": volume_ton,
+            "referrals_level1": lvl1,
+            "referrals_level2": lvl2,
+            "referrals_level3": lvl3,
+            "total_referrals": total_refs,
+            "level": level,
+            "max_level": max_level,
+            "progress_percent": progress_percent,
+            "to_next_volume_rub": round(to_next_volume_rub, 2),
+            "ton_rate_rub": ton_rate,
+        }
+        return _json_response(payload)
+
+    app.router.add_get("/api/referral/stats", referral_stats_handler)
+    app.router.add_route("OPTIONS", "/api/referral/stats", lambda r: Response(status=204, headers=_cors_headers()))
+
+    async def referral_withdraw_handler(request):
+        """
+        Создание заявки на вывод реферальных средств.
+        JSON: { "user_id", "amount_rub", "method", "details" }
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            return _json_response({"error": "bad_request", "message": "Invalid JSON"}, status=400)
+
+        user_id = body.get("user_id")
+        amount_rub = body.get("amount_rub") or body.get("amount")
+        method = (body.get("method") or "").strip()
+        details = (body.get("details") or "").strip()
+
+        try:
+            if user_id is None:
+                raise ValueError("user_id required")
+            uid = str(int(str(user_id).strip()))
+            amount = float(amount_rub or 0)
+        except Exception:
+            return _json_response({"error": "bad_request", "message": "user_id(int) и amount_rub(number) обязательны"}, status=400)
+
+        if amount <= 0:
+            return _json_response({"error": "bad_request", "message": "amount_rub должен быть > 0"}, status=400)
+
+        _load_referrals()
+        ref = _get_or_create_ref_user(uid)
+        current_balance = float(ref.get("earned_rub") or 0.0)
+        if amount > current_balance + 1e-6:
+            return _json_response(
+                {"error": "insufficient_funds", "message": "Недостаточно реферальных средств", "current_balance_rub": round(current_balance, 2)},
+                status=400,
+            )
+
+        ref["earned_rub"] = current_balance - amount
+        _save_referrals()
+
+        # Пытаемся отправить уведомление в рабочую группу
+        if REFERRAL_WITHDRAW_CHAT_ID:
+            try:
+                # Получаем пользователя через бота (чтоб взять username / имя)
+                try:
+                    tg_user = await bot.get_chat(int(uid))
+                except Exception:
+                    tg_user = None
+                username = getattr(tg_user, "username", None) if tg_user else None
+                first_name = getattr(tg_user, "first_name", None) if tg_user else None
+                last_name = getattr(tg_user, "last_name", None) if tg_user else None
+                line = username and f"@{username}" or (first_name or "") + (" " + last_name if last_name else "")
+                if not line:
+                    line = uid
+
+                text = (
+                    "💸 <b>Новая заявка на вывод реферальных средств</b>\n\n"
+                    f"Пользователь: {line}\n"
+                    f"ID: <code>{uid}</code>\n"
+                    f"Сумма вывода: <b>{amount:.2f} ₽</b>\n"
+                    f"Метод: <b>{method or 'не указан'}</b>\n"
+                    f"Реквизиты:\n<code>{details or 'не указаны'}</code>\n\n"
+                    f"Остаток по реф.балансу: <b>{ref['earned_rub']:.2f} ₽</b>"
+                )
+                await bot.send_message(REFERRAL_WITHDRAW_CHAT_ID, text, parse_mode="HTML")
+            except Exception as e:
+                logger.error(f"Не удалось отправить заявку на вывод реферальных средств: {e}")
+
+        return _json_response({"success": True, "new_balance_rub": round(ref["earned_rub"], 2)})
+
+    app.router.add_post("/api/referral/withdraw", referral_withdraw_handler)
+    app.router.add_route("OPTIONS", "/api/referral/withdraw", lambda r: Response(status=204, headers=_cors_headers()))
+
+    async def referral_link_handler(request):
+        """
+        Простейшая реферальная ссылка формата:
+        https://t.me/<bot_username>?start=ref_<user_id>
+        GET /api/referral/link?user_id=...
+        """
+        user_id = request.rel_url.query.get("user_id", "").strip()
+        if not user_id:
+            return _json_response({"error": "bad_request", "message": "user_id required"}, status=400)
+        try:
+            uid = str(int(user_id))
+        except Exception:
+            uid = str(user_id)
+
+        try:
+            me = await bot.get_me()
+            bot_username = me.username or "JetSold_bot"
+        except Exception:
+            bot_username = "JetSold_bot"
+
+        url = f"https://t.me/{bot_username}?start=ref_{uid}"
+        return _json_response({"url": url, "user_id": uid, "bot_username": bot_username})
+
+    app.router.add_get("/api/referral/link", referral_link_handler)
+    app.router.add_route("OPTIONS", "/api/referral/link", lambda r: Response(status=204, headers=_cors_headers()))
+
+    # Продажа звёзд из мини-приложения: создать счёт XTR и сохранить данные выплаты
+    async def sellstars_create_invoice_handler(request):
+        try:
+            body = await request.json()
+        except Exception:
+            return _json_response({"error": "bad_request", "message": "Invalid JSON"}, status=400)
+
+        telegram_id = body.get("telegram_id") or body.get("user_id")
+        if telegram_id is None:
+            return _json_response({"error": "bad_request", "message": "telegram_id обязателен"}, status=400)
+        try:
+            telegram_id = int(telegram_id)
+        except (TypeError, ValueError):
+            return _json_response({"error": "bad_request", "message": "telegram_id должен быть числом"}, status=400)
+
+        stars_amount = body.get("stars_amount")
+        try:
+            stars_amount = int(stars_amount) if stars_amount is not None else 0
+        except (TypeError, ValueError):
+            stars_amount = 0
+        if stars_amount < 100:
+            return _json_response({"error": "bad_request", "message": "Минимум 100 звёзд"}, status=400)
+        if stars_amount > 50000:
+            return _json_response({"error": "bad_request", "message": "Максимум 50 000 звёзд"}, status=400)
+
+        method = (body.get("method") or "wallet").strip().lower()
+        if method not in ("wallet", "sbp", "card"):
+            return _json_response({"error": "bad_request", "message": "method: wallet, sbp или card"}, status=400)
+
+        order_id = str(uuid.uuid4())
+        payout_rub = round(stars_amount * STAR_BUY_RATE_RUB, 2)
+
+        order_data = {
+            "user_id": telegram_id,
+            "username": (body.get("username") or "").strip(),
+            "first_name": (body.get("first_name") or "").strip(),
+            "last_name": (body.get("last_name") or "").strip(),
+            "stars_amount": stars_amount,
+            "method": method,
+            "payout_rub": payout_rub,
+        }
+        if method == "wallet":
+            order_data["wallet_address"] = (body.get("wallet_address") or "").strip()
+            order_data["wallet_memo"] = (body.get("wallet_memo") or "").strip()
+        elif method == "sbp":
+            order_data["sbp_phone"] = (body.get("sbp_phone") or "").strip()
+            order_data["sbp_bank"] = (body.get("sbp_bank") or "").strip()
+        elif method == "card":
+            order_data["card_number"] = (body.get("card_number") or "").strip()
+            order_data["card_bank"] = (body.get("card_bank") or "").strip()
+
+        PENDING_SELL_STARS_ORDERS[order_id] = order_data
+
+        try:
+            await bot.send_message(
+                telegram_id,
+                "Оплатите счёт для успешной продажи звёзд:",
+                parse_mode=None,
+            )
+            await bot.send_invoice(
+                chat_id=telegram_id,
+                title="Продажа звёзд",
+                description=f"Продажа {stars_amount} ⭐. Вы получите примерно {payout_rub:.2f} ₽.",
+                payload=f"sell_stars:{order_id}",
+                provider_token="1744374395:TEST:36675594277e9de887a6",
+                currency="XTR",
+                prices=[LabeledPrice(label="Звёзды", amount=stars_amount)],
+                max_tip_amount=0,
+                need_name=False,
+                need_phone_number=False,
+                need_email=False,
+                need_shipping_address=False,
+                is_flexible=False,
+            )
+        except Exception as e:
+            PENDING_SELL_STARS_ORDERS.pop(order_id, None)
+            logger.exception(f"sellstars create-invoice send_invoice: {e}")
+            return _json_response({"error": "send_failed", "message": str(e)}, status=502)
+
+        return _json_response({"success": True, "order_id": order_id})
+
+    app.router.add_post("/api/sellstars/create-invoice", sellstars_create_invoice_handler)
+    app.router.add_route("OPTIONS", "/api/sellstars/create-invoice", lambda r: Response(status=204, headers=_cors_headers()))
 
     async def ton_pack_address_handler(request):
         """Конвертация raw-адреса TON (0:hex) в user-friendly через TonCenter."""
@@ -1657,6 +2346,199 @@ def setup_http_server():
     CRYPTO_PAY_TOKEN = _get_env_clean("CRYPTO_PAY_TOKEN") or _cryptobot_cfg_early.get("api_token", "")
     CRYPTO_PAY_BASE = "https://pay.crypt.bot/api"
 
+    # Fragment.com (сайт) — вызов fragment.com/api через cookies + hash (как в ezstar).
+    _script_dir = os.path.dirname(os.path.abspath(__file__))
+    _fragment_site_cfg = _read_json_file(os.path.join(_script_dir, "fragment_site_config.json"))
+    if not _fragment_site_cfg:
+        _fragment_site_cfg = _read_json_file(os.path.join(os.getcwd(), "fragment_site_config.json"))
+    if not _fragment_site_cfg:
+        _parent_cfg = _read_json_file(os.path.join(os.path.dirname(_script_dir), "fragment_site_config.json"))
+        if _parent_cfg:
+            _fragment_site_cfg = _parent_cfg
+    if not _fragment_site_cfg:
+        logger.warning("fragment_site_config.json не найден (искали в %s и cwd); задайте TONAPI_KEY и MNEMONIC в переменных окружения", _script_dir)
+    if not TON_PAYMENT_ADDRESS.get("value") and _fragment_site_cfg:
+        TON_PAYMENT_ADDRESS["value"] = str(_fragment_site_cfg.get("ton_payment_address") or "").strip()
+    FRAGMENT_SITE_COOKIES = (
+        _get_env_clean("FRAGMENT_SITE_COOKIES")
+        or _get_env_clean("FRAGMENT_COOKIES")
+        or str(_fragment_site_cfg.get("cookies", "") or "").strip()
+    )
+    FRAGMENT_SITE_HASH = (
+        _get_env_clean("FRAGMENT_SITE_HASH")
+        or _get_env_clean("FRAGMENT_HASH")
+        or str(_fragment_site_cfg.get("hash", "") or "").strip()
+    )
+    FRAGMENT_SITE_ENABLED = bool(FRAGMENT_SITE_COOKIES and FRAGMENT_SITE_HASH)
+    # TON-кошелёк бота для отправки TON в Fragment (как в ezstar: бот сам платит Fragment, звёзды приходят получателю).
+    TONAPI_KEY = _get_env_clean("TONAPI_KEY") or str(_fragment_site_cfg.get("tonapi_key", "") or "").strip()
+    _mnemonic_raw = _get_env_clean("MNEMONIC") or _fragment_site_cfg.get("mnemonic")
+    if isinstance(_mnemonic_raw, str):
+        MNEMONIC = [s.strip() for s in _mnemonic_raw.replace(",", " ").split() if s.strip()] if _mnemonic_raw else []
+    elif isinstance(_mnemonic_raw, list):
+        MNEMONIC = [str(x).strip() for x in _mnemonic_raw if str(x).strip()]
+    else:
+        MNEMONIC = []
+    TON_WALLET_ENABLED = bool(TONAPI_KEY and len(MNEMONIC) >= 24)
+
+    def _fragment_site_headers(*, referer: str) -> dict:
+        return {
+            "accept": "application/json, text/javascript, */*; q=0.01",
+            "accept-language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+            "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "origin": "https://fragment.com",
+            "referer": referer,
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-origin",
+            "cookie": FRAGMENT_SITE_COOKIES,
+            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "x-requested-with": "XMLHttpRequest",
+        }
+
+    async def _fragment_site_post(method_payload: dict, *, referer: str) -> dict:
+        if not FRAGMENT_SITE_ENABLED:
+            raise RuntimeError("FRAGMENT_SITE_COOKIES/FRAGMENT_SITE_HASH not configured")
+        params = {"hash": FRAGMENT_SITE_HASH}
+        url = "https://fragment.com/api"
+        headers = _fragment_site_headers(referer=referer)
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, params=params, headers=headers, data=method_payload) as resp:
+                data = await resp.json(content_type=None)
+                if resp.status >= 400:
+                    raise RuntimeError(f"fragment.com/api error {resp.status}: {data}")
+                return data if isinstance(data, dict) else {"data": data}
+
+    def _fragment_encoded(encoded_string: str) -> str:
+        """Декодирование payload из Fragment (как ezstar api/fragment.encoded)."""
+        s = (encoded_string or "").strip()
+        missing = len(s) % 4
+        if missing:
+            s += "=" * (4 - missing)
+        try:
+            decoded = base64.b64decode(s).decode("utf-8", errors="ignore")
+            for i, c in enumerate(decoded):
+                if c.isdigit():
+                    return decoded[i:]
+            return decoded
+        except Exception:
+            return encoded_string
+
+    def _extract_any_url(obj) -> Optional[str]:
+        # Пытаемся найти URL в ответе Fragment (встречается как payment_url/link/url или внутри HTML)
+        if isinstance(obj, dict):
+            for k in ("payment_url", "paymentUrl", "pay_url", "payUrl", "url", "link"):
+                v = obj.get(k)
+                if isinstance(v, str) and v.startswith(("http://", "https://")):
+                    return v
+            for v in obj.values():
+                u = _extract_any_url(v)
+                if u:
+                    return u
+        elif isinstance(obj, list):
+            for v in obj:
+                u = _extract_any_url(v)
+                if u:
+                    return u
+        elif isinstance(obj, str):
+            m = re.search(r"https?://[^\s\"'<>]+", obj)
+            if m:
+                return m.group(0)
+        return None
+
+    # --- ezstar: получение адреса получателя (found.recipient), init, getBuyStarsLink → transaction.messages[0] ---
+    async def _fragment_get_recipient_address(username: str) -> tuple:
+        """Поиск получателя (searchStarsRecipient). Возвращает (name, address) как в ezstar."""
+        referer = f"https://fragment.com/stars/buy?recipient={username}&quantity=50"
+        payload = {"query": username, "quantity": "", "method": "searchStarsRecipient"}
+        data = await _fragment_site_post(payload, referer=referer)
+        found = (data or {}).get("found")
+        if not found or not isinstance(found, dict):
+            raise RuntimeError("Fragment: получатель не найден (found)")
+        name = found.get("name")
+        address = found.get("recipient")
+        if not address:
+            raise RuntimeError("Fragment: у получателя нет recipient (address)")
+        return (name or username, str(address).strip())
+
+    async def _fragment_init_buy(recipient_address: str, quantity: int) -> str:
+        """Инициализация покупки (initBuyStarsRequest). recipient = address из found.recipient. Возвращает req_id."""
+        referer = "https://fragment.com/stars/buy?recipient=test&quantity=50"
+        payload = {"recipient": recipient_address, "quantity": int(quantity), "method": "initBuyStarsRequest"}
+        data = await _fragment_site_post(payload, referer=referer)
+        req_id = (data or {}).get("req_id") or (data or {}).get("id")
+        if not req_id:
+            req_id = ((data or {}).get("data") or {}).get("id") if isinstance((data or {}).get("data"), dict) else None
+        if not req_id:
+            raise RuntimeError(f"Fragment initBuyStarsRequest: нет req_id в ответе: {data}")
+        return str(req_id)
+
+    async def _fragment_get_buy_link(req_id: str) -> tuple:
+        """Получение данных для оплаты (getBuyStarsLink). Возвращает (address, amount_nanoton, payload_b64) как в ezstar."""
+        referer = "https://fragment.com/stars/buy?recipient=test&quantity=50"
+        payload = {"transaction": "1", "id": str(req_id), "show_sender": "0", "method": "getBuyStarsLink"}
+        data = await _fragment_site_post(payload, referer=referer)
+        tx = (data or {}).get("transaction")
+        if not tx or not isinstance(tx, dict):
+            raise RuntimeError("Fragment getBuyStarsLink: нет transaction в ответе")
+        messages = tx.get("messages") or []
+        if not messages or not isinstance(messages[0], dict):
+            raise RuntimeError("Fragment getBuyStarsLink: нет transaction.messages[0]")
+        msg = messages[0]
+        address = msg.get("address")
+        amount = msg.get("amount")
+        payload_b64 = msg.get("payload") or ""
+        if not address:
+            raise RuntimeError("Fragment getBuyStarsLink: нет address в messages[0]")
+        if amount is None:
+            raise RuntimeError("Fragment getBuyStarsLink: нет amount в messages[0]")
+        return (str(address).strip(), int(amount), str(payload_b64))
+
+    async def _ton_wallet_send_safe(address: str, amount_nanoton: int, body_payload: str) -> Optional[str]:
+        if not TONAPI_KEY or not MNEMONIC:
+            return None
+        try:
+            from tonutils.client import TonapiClient
+            from tonutils.utils import to_amount
+            from tonutils.wallet import WalletV5R1
+            client = TonapiClient(api_key=TONAPI_KEY, is_testnet=False)
+            wallet, _, _, _ = WalletV5R1.from_mnemonic(client, MNEMONIC)
+            amount_val = to_amount(amount_nanoton, 9, 9)
+            if asyncio.iscoroutinefunction(wallet.transfer):
+                tx_hash = await wallet.transfer(destination=address, amount=amount_val, body=body_payload)
+            else:
+                tx_hash = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: wallet.transfer(destination=address, amount=amount_val, body=body_payload)
+                )
+            return str(tx_hash) if tx_hash else None
+        except Exception as e:
+            logger.exception("TON wallet send error: %s", e)
+            return None
+
+    async def _fragment_site_create_star_order(app_: web.Application, *, recipient: str, stars_amount: int) -> dict:
+        """Создание заказа: только валидация + при наличии кошелька не отдаём ссылку (оплата через CryptoBot, затем deliver-stars)."""
+        referer = f"https://fragment.com/stars/buy?recipient={recipient}&quantity={stars_amount}"
+        search_payload = {"query": recipient, "quantity": "", "method": "searchStarsRecipient"}
+        search = await _fragment_site_post(search_payload, referer=referer)
+        found = (search or {}).get("found")
+        if not found or not isinstance(found, dict) or not found.get("recipient"):
+            raise RuntimeError("Fragment: получатель не найден")
+        if TON_WALLET_ENABLED:
+            return {"success": True, "order_id": None, "payment_url": None, "mode": "wallet"}
+        address = found.get("recipient")
+        init_payload = {"recipient": address, "quantity": int(stars_amount), "method": "initBuyStarsRequest"}
+        init = await _fragment_site_post(init_payload, referer=referer)
+        req_id = (init or {}).get("req_id") or (init or {}).get("id") or str((init or {}).get("data") or {}).get("id", "")
+        if not req_id:
+            raise RuntimeError(f"Fragment initBuyStarsRequest: нет req_id в ответе: {init}")
+        link_payload = {"transaction": "1", "id": str(req_id), "show_sender": "0", "method": "getBuyStarsLink"}
+        link = await _fragment_site_post(link_payload, referer=referer)
+        pay_url = _extract_any_url(link)
+        if isinstance(app_.get("fragment_site_orders"), dict):
+            app_["fragment_site_orders"][req_id] = {"type": "stars", "recipient": recipient, "quantity": int(stars_amount), "created_at": time.time()}
+        return {"success": True, "order_id": req_id, "payment_url": pay_url or None, "order": {"search": search, "init": init, "link": link}}
+
     # Проверка оплаты (Fragment.com / TonKeeper / CryptoBot).
     async def payment_check_handler(request):
         try:
@@ -1671,9 +2553,62 @@ def setup_http_server():
         transaction_id = (body.get("transaction_id") or body.get("transactionId") or "").strip()
         invoice_id = body.get("invoice_id")
         method = (body.get("method") or "").strip().lower()
-        completed = request.app.get("fragment_completed_orders") or set()
-        if order_id and order_id in completed:
-            return _json_response({"paid": True, "order_id": order_id, "delivered_by_fragment": True})
+        # Fragment.com (site): пробуем проверить статус по order_id (req_id)
+        # Важно: пытаемся проверять даже если сервер перезапускался и meta не сохранилось.
+        if is_stars and order_id and FRAGMENT_SITE_ENABLED:
+            try:
+                site_orders = request.app.get("fragment_site_orders") or {}
+                meta = site_orders.get(order_id) if isinstance(site_orders, dict) else None
+                meta = meta or {}
+                rec = (meta.get("recipient") or "").strip()
+                qty = meta.get("quantity")
+                referer = "https://fragment.com/stars/buy"
+                if rec and qty:
+                    referer = f"https://fragment.com/stars/buy?recipient={rec}&quantity={qty}"
+                link_payload = {"transaction": "1", "id": str(order_id), "show_sender": "0", "method": "getBuyStarsLink"}
+                link = await _fragment_site_post(link_payload, referer=referer)
+                if _fragment_site_is_paid(link):
+                    return _json_response({"paid": True, "order_id": order_id, "delivered_by_fragment": True})
+                return _json_response({"paid": False, "order_id": order_id})
+            except Exception as e:
+                logger.warning(f"Fragment(site) payment check failed for order_id={order_id}: {e}")
+                return _json_response({"paid": False, "order_id": order_id})
+        # TON (Tonkeeper): строгая проверка через TonAPI по сумме и уникальному order_id в действии
+        _ton_addr = (TON_PAYMENT_ADDRESS.get("value") or "").strip()
+        if method == "ton" and order_id and _ton_addr and TONAPI_KEY:
+            ton_orders = request.app.get("ton_orders") or {}
+            order = ton_orders.get(order_id) if isinstance(ton_orders, dict) else None
+            if order:
+                try:
+                    addr = _ton_addr.strip()
+                    if not re.match(r"^[A-Za-z0-9_-]{48}$", addr):
+                        addr = addr.replace(" ", "").replace("://", "")
+                    url = f"https://tonapi.io/v2/accounts/{addr}/events?limit=50"
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(
+                            url,
+                            headers={"Authorization": f"Bearer {TONAPI_KEY}", "Content-Type": "application/json"}
+                        ) as resp:
+                            data = await resp.json(content_type=None) if resp.content_type else {}
+                    events = data.get("events") or []
+                    want_nanoton = int(order.get("amount_nanoton") or 0)
+                    # Проходим по всем TonTransfer и ищем тот, в JSON которого встречается order_id и хватает суммы
+                    for ev in events:
+                        for act in ev.get("actions") or []:
+                            if act.get("type") == "TonTransfer":
+                                try:
+                                    blob = json.dumps(act, ensure_ascii=False)
+                                except Exception:
+                                    blob = str(act)
+                                if order_id not in blob:
+                                    continue
+                                amount = int(act.get("amount") or 0)
+                                if amount >= max(0, want_nanoton - int(1e6)):
+                                    logger.info("TON payment confirmed via TonAPI for order_id=%s, amount=%s", order_id, amount)
+                                    return _json_response({"paid": True, "order_id": order_id, "method": "ton"})
+                except Exception as e:
+                    logger.warning(f"TON payment check failed for order_id={order_id}: {e}")
+            return _json_response({"paid": False, "order_id": order_id})
         if invoice_id and method == "cryptobot" and CRYPTO_PAY_TOKEN:
             try:
                 async with aiohttp.ClientSession() as session:
@@ -1684,17 +2619,27 @@ def setup_http_server():
                     ) as resp:
                         cdata = await resp.json(content_type=None) if resp.content_type else {}
                         if cdata.get("ok"):
-                            items = cdata.get("result")
+                            result = cdata.get("result")
+                            # Crypto Pay API обычно возвращает {"result": {"items": [...]}}
+                            items = []
+                            if isinstance(result, dict):
+                                items = result.get("items") or []
+                            elif isinstance(result, list):
+                                items = result
                             if isinstance(items, list):
-                                for inv in items:
-                                    if str(inv.get("invoice_id")) == str(invoice_id) and inv.get("status") == "paid":
-                                        return _json_response({"paid": True, "invoice_id": invoice_id})
+                                paid = any(
+                                    str(inv.get("invoice_id")) == str(invoice_id) and inv.get("status") == "paid"
+                                    for inv in items if isinstance(inv, dict)
+                                )
+                                if paid:
+                                    return _json_response({"paid": True, "invoice_id": invoice_id})
             except Exception as e:
                 logger.warning(f"Crypto Pay check invoice {invoice_id}: {e}")
         if invoice_id and method == "cryptobot":
             return _json_response({"paid": False})
+        # Fragment.com (site flow): если не нашли заказ в памяти — подтвердить оплату не можем.
         if is_stars or is_premium:
-            return _json_response({"paid": True})
+            return _json_response({"paid": False, "order_id": order_id or None})
         if transaction_id:
             pass
         return _json_response({"paid": False})
@@ -1702,131 +2647,63 @@ def setup_http_server():
     app.router.add_post("/api/payment/check", payment_check_handler)
     app.router.add_route("OPTIONS", "/api/payment/check", lambda r: Response(status=204, headers=_cors_headers()))
     
-    # Fragment.com — выдача звёзд после покупки (iStar API)
-    # Документация: https://istar.fragmentapi.com/docs
-    _fragment_cfg = _read_json_file(os.path.join(os.path.dirname(os.path.abspath(__file__)), "fragment_config.json"))
-    FRAGMENT_API_KEY = _get_env_clean("FRAGMENT_API_KEY") or _fragment_cfg.get("api_key", "")
-    FRAGMENT_BASE = _fragment_cfg.get("base_url", "https://v1.fragmentapi.com/api/v1/partner") or "https://v1.fragmentapi.com/api/v1/partner"
-    
+    async def fragment_status_handler(request):
+        """Healthcheck Fragment.com (cookies+hash) и TON-кошелька (ezstar)."""
+        if not FRAGMENT_SITE_ENABLED:
+            return _json_response({"configured": False, "api_ok": False, "mode": "site", "wallet_enabled": False}, status=503)
+        return _json_response({
+            "configured": True,
+            "api_ok": True,
+            "mode": "wallet" if TON_WALLET_ENABLED else "site",
+            "wallet_enabled": TON_WALLET_ENABLED,
+        })
+
+    app.router.add_get("/api/fragment/status", fragment_status_handler)
+    app.router.add_route("OPTIONS", "/api/fragment/status", lambda r: Response(status=204, headers=_cors_headers()))
+
     async def fragment_deliver_stars_handler(request):
-        """Выдача звёзд через fragment.com после успешной оплаты"""
-        if not FRAGMENT_API_KEY:
-            return _json_response({"error": "not_configured", "message": "FRAGMENT_API_KEY not set (fragment_config.json)"}, status=503)
+        """Выдача звёзд как в ezstar: бот отправляет TON с своего кошелька в Fragment (get address → init → get link → send TON)."""
+        if not TON_WALLET_ENABLED:
+            return _json_response({
+                "error": "not_configured",
+                "message": "TONAPI_KEY и MNEMONIC не заданы. Укажите в fragment_site_config.json (рядом с bot.py или в текущей папке) или в переменных окружения TONAPI_KEY и MNEMONIC (24 слова через пробел)."
+            }, status=503)
         try:
             body = await request.json()
         except Exception:
             return _json_response({"error": "bad_request", "message": "Invalid JSON"}, status=400)
-        
+        recipient = (body.get("recipient") or body.get("username") or "").strip().lstrip("@")
         stars_amount = body.get("stars_amount") or body.get("quantity")
-        recipient = (body.get("recipient") or body.get("username") or "").strip().lstrip("@")
-        
-        if not stars_amount:
-            return _json_response({"error": "bad_request", "message": "stars_amount is required"}, status=400)
+        if not recipient or not stars_amount:
+            return _json_response({"error": "bad_request", "message": "recipient и stars_amount обязательны"}, status=400)
         stars_amount = int(stars_amount)
-        if stars_amount < 50:
-            return _json_response({"error": "bad_request", "message": "Minimum 50 stars"}, status=400)
-        if stars_amount > 1_000_000:
-            return _json_response({"error": "bad_request", "message": "Maximum 1,000,000 stars"}, status=400)
-        if not recipient:
-            return _json_response({"error": "bad_request", "message": "recipient (username) is required"}, status=400)
-        
-        headers = {"Content-Type": "application/json", "API-Key": FRAGMENT_API_KEY}
-        
+        if stars_amount < 50 or stars_amount > 1_000_000:
+            return _json_response({"error": "bad_request", "message": "stars_amount 50..1000000"}, status=400)
+        if not FRAGMENT_SITE_ENABLED:
+            return _json_response({"error": "not_configured", "message": "Fragment cookies+hash не заданы"}, status=503)
         try:
-            async with aiohttp.ClientSession() as session:
-                # 1) Валидация получателя
-                async with session.get(
-                    f"{FRAGMENT_BASE}/star/recipient/search",
-                    params={"username": recipient, "quantity": stars_amount},
-                    headers={"API-Key": FRAGMENT_API_KEY}
-                ) as resp:
-                    val_data = await resp.json(content_type=None) if resp.content_type else {}
-                    if resp.status >= 400:
-                        return _json_response({
-                            "error": "fragment_validation",
-                            "message": val_data.get("message", val_data.get("error", "Invalid recipient")),
-                            "details": val_data
-                        }, status=400)
-                    recipient_hash = val_data.get("recipient")
-                    if not recipient_hash:
-                        return _json_response({"error": "fragment_validation", "message": "Recipient not found"}, status=400)
-                
-                # 2) Создание заказа на выдачу звёзд
-                payload = {"username": recipient, "recipient_hash": recipient_hash, "quantity": stars_amount, "wallet_type": "TON"}
-                async with session.post(f"{FRAGMENT_BASE}/orders/star", headers=headers, json=payload) as resp:
-                    data = await resp.json(content_type=None) if resp.content_type else {}
-                    if resp.status >= 400:
-                        return _json_response({
-                            "error": "fragment_error",
-                            "message": data.get("message", data.get("error", "Fragment API error")),
-                            "details": data
-                        }, status=502)
-                    return _json_response({"success": True, "order": data, "stars_amount": stars_amount, "recipient": recipient})
+            _, recipient_address = await _fragment_get_recipient_address(recipient)
+            req_id = await _fragment_init_buy(recipient_address, stars_amount)
+            tx_address, amount_nanoton, payload_b64 = await _fragment_get_buy_link(req_id)
+            payload_decoded = _fragment_encoded(payload_b64)
+            tx_hash = await _ton_wallet_send_safe(tx_address, amount_nanoton, payload_decoded)
+            if not tx_hash:
+                return _json_response({"error": "wallet_error", "message": "Не удалось отправить TON (проверьте баланс и логи)"}, status=502)
+            logger.info("Fragment stars delivered: recipient=%s, amount=%s, tx=%s", recipient, stars_amount, tx_hash)
+            return _json_response({"success": True, "recipient": recipient, "stars_amount": stars_amount, "tx_hash": tx_hash})
+        except RuntimeError as e:
+            logger.warning("Fragment deliver-stars: %s", e)
+            return _json_response({"error": "fragment_error", "message": str(e)}, status=400)
         except Exception as e:
-            logger.error(f"Fragment deliver stars error: {e}")
+            logger.exception("Fragment deliver-stars error: %s", e)
             return _json_response({"error": "internal_error", "message": str(e)}, status=500)
-    
+
     app.router.add_post("/api/fragment/deliver-stars", fragment_deliver_stars_handler)
-    app.router.add_route('OPTIONS', '/api/fragment/deliver-stars', lambda r: Response(status=204, headers=_cors_headers()))
+    app.router.add_route("OPTIONS", "/api/fragment/deliver-stars", lambda r: Response(status=204, headers=_cors_headers()))
 
-    async def fragment_deliver_premium_handler(request):
-        """Выдача Premium через fragment.com (iStar API), оплата TonKeeper"""
-        if not FRAGMENT_API_KEY:
-            return _json_response({"error": "not_configured", "message": "FRAGMENT_API_KEY not set (fragment_config.json)"}, status=503)
-        try:
-            body = await request.json()
-        except Exception:
-            return _json_response({"error": "bad_request", "message": "Invalid JSON"}, status=400)
-        recipient = (body.get("recipient") or body.get("username") or "").strip().lstrip("@")
-        months = body.get("months", 3)
-        try:
-            months = int(months)
-        except (TypeError, ValueError):
-            months = 3
-        if months not in (3, 6, 12):
-            months = 3
-        if not recipient:
-            return _json_response({"error": "bad_request", "message": "recipient (username) is required"}, status=400)
-        headers = {"Content-Type": "application/json", "API-Key": FRAGMENT_API_KEY}
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{FRAGMENT_BASE}/premium/recipient/search",
-                    params={"username": recipient, "months": months},
-                    headers={"API-Key": FRAGMENT_API_KEY}
-                ) as resp:
-                    val_data = await resp.json(content_type=None) if resp.content_type else {}
-                    if resp.status >= 400:
-                        return _json_response({
-                            "error": "fragment_validation",
-                            "message": val_data.get("message", val_data.get("error", "Invalid recipient")),
-                            "details": val_data
-                        }, status=400)
-                    recipient_hash = val_data.get("recipient")
-                    if not recipient_hash:
-                        return _json_response({"error": "fragment_validation", "message": "Recipient not found"}, status=400)
-                payload = {"username": recipient, "recipient_hash": recipient_hash, "months": months, "wallet_type": "TON"}
-                async with session.post(f"{FRAGMENT_BASE}/orders/premium", headers=headers, json=payload) as resp:
-                    data = await resp.json(content_type=None) if resp.content_type else {}
-                    if resp.status >= 400:
-                        return _json_response({
-                            "error": "fragment_error",
-                            "message": data.get("message", data.get("error", "Fragment API error")),
-                            "details": data
-                        }, status=502)
-                    return _json_response({"success": True, "order": data, "months": months, "recipient": recipient})
-        except Exception as e:
-            logger.error(f"Fragment deliver premium error: {e}")
-            return _json_response({"error": "internal_error", "message": str(e)}, status=500)
-
-    app.router.add_post("/api/fragment/deliver-premium", fragment_deliver_premium_handler)
-    app.router.add_route("OPTIONS", "/api/fragment/deliver-premium", lambda r: Response(status=204, headers=_cors_headers()))
-
-    # Создание заказа Fragment (звёзды/премиум) — пользователь оплачивает в Fragment/TonKeeper, затем вебхук → payment_check по order_id
+    # Создание заказа Fragment: при наличии TON-кошелька — только валидация (оплата CryptoBot → deliver-stars). Иначе — ссылка на оплату TON.
     async def fragment_create_star_order_handler(request):
         """Создать заказ на звёзды: возвращает order_id и payment_url (если API отдаёт), фронт открывает ссылку оплаты TonKeeper"""
-        if not FRAGMENT_API_KEY:
-            return _json_response({"error": "not_configured", "message": "FRAGMENT_API_KEY not set"}, status=503)
         try:
             body = await request.json()
         except Exception:
@@ -1840,115 +2717,52 @@ def setup_http_server():
             return _json_response({"error": "bad_request", "message": "stars_amount 50..1000000"}, status=400)
         if not recipient:
             return _json_response({"error": "bad_request", "message": "recipient is required"}, status=400)
-        headers = {"Content-Type": "application/json", "API-Key": FRAGMENT_API_KEY}
+
+        if not FRAGMENT_SITE_ENABLED:
+            return _json_response({
+                "error": "not_configured",
+                "message": "Set FRAGMENT_SITE_COOKIES + FRAGMENT_SITE_HASH (or FRAGMENT_COOKIES + FRAGMENT_HASH)"
+            }, status=503)
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{FRAGMENT_BASE}/star/recipient/search",
-                    params={"username": recipient, "quantity": stars_amount},
-                    headers={"API-Key": FRAGMENT_API_KEY}
-                ) as resp:
-                    val_data = await resp.json(content_type=None) if resp.content_type else {}
-                    if resp.status >= 400 or not val_data.get("recipient"):
-                        return _json_response({
-                            "error": "fragment_validation",
-                            "message": val_data.get("message", "Recipient not found")
-                        }, status=400)
-                    recipient_hash = val_data.get("recipient")
-                payload = {"username": recipient, "recipient_hash": recipient_hash, "quantity": stars_amount, "wallet_type": "TON"}
-                async with session.post(f"{FRAGMENT_BASE}/orders/star", headers=headers, json=payload) as resp:
-                    data = await resp.json(content_type=None) if resp.content_type else {}
-                    if resp.status >= 400:
-                        return _json_response({
-                            "error": "fragment_error",
-                            "message": data.get("message", data.get("error", "Fragment API error"))
-                        }, status=502)
-                    order_id = data.get("order_id") or data.get("id") or ""
-                    payment_url = data.get("payment_link") or data.get("payment_url") or data.get("pay_url") or ""
-                    return _json_response({
-                        "success": True, "order_id": order_id, "payment_url": payment_url or None,
-                        "order": data, "stars_amount": stars_amount, "recipient": recipient
-                    })
+            if TON_WALLET_ENABLED:
+                await _fragment_get_recipient_address(recipient)
+                return _json_response({
+                    "success": True,
+                    "order_id": None,
+                    "payment_url": None,
+                    "stars_amount": stars_amount,
+                    "recipient": recipient,
+                    "mode": "wallet",
+                    "message": "Оплатите через CryptoBot; после оплаты нажмите «Подтвердить оплату» — звёзды будут отправлены автоматически.",
+                })
+            res = await _fragment_site_create_star_order(request.app, recipient=recipient, stars_amount=stars_amount)
+            return _json_response({
+                "success": True,
+                "order_id": res.get("order_id"),
+                "payment_url": res.get("payment_url"),
+                "order": res.get("order"),
+                "stars_amount": stars_amount,
+                "recipient": recipient,
+                "mode": "site",
+            })
         except Exception as e:
             logger.error(f"Fragment create star order error: {e}")
-            return _json_response({"error": "internal_error", "message": str(e)}, status=500)
+            return _json_response({"error": "fragment_site_error", "message": str(e)}, status=502)
 
     async def fragment_create_premium_order_handler(request):
         """Создать заказ на Premium: возвращает order_id и payment_url (если есть), фронт открывает оплату TonKeeper"""
-        if not FRAGMENT_API_KEY:
-            return _json_response({"error": "not_configured", "message": "FRAGMENT_API_KEY not set"}, status=503)
-        try:
-            body = await request.json()
-        except Exception:
-            return _json_response({"error": "bad_request", "message": "Invalid JSON"}, status=400)
-        recipient = (body.get("recipient") or body.get("username") or "").strip().lstrip("@")
-        months = body.get("months", 3)
-        try:
-            months = int(months)
-        except (TypeError, ValueError):
-            months = 3
-        if months not in (3, 6, 12):
-            months = 3
-        if not recipient:
-            return _json_response({"error": "bad_request", "message": "recipient is required"}, status=400)
-        headers = {"Content-Type": "application/json", "API-Key": FRAGMENT_API_KEY}
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{FRAGMENT_BASE}/premium/recipient/search",
-                    params={"username": recipient, "months": months},
-                    headers={"API-Key": FRAGMENT_API_KEY}
-                ) as resp:
-                    val_data = await resp.json(content_type=None) if resp.content_type else {}
-                    if resp.status >= 400 or not val_data.get("recipient"):
-                        return _json_response({
-                            "error": "fragment_validation",
-                            "message": val_data.get("message", "Recipient not found")
-                        }, status=400)
-                    recipient_hash = val_data.get("recipient")
-                payload = {"username": recipient, "recipient_hash": recipient_hash, "months": months, "wallet_type": "TON"}
-                async with session.post(f"{FRAGMENT_BASE}/orders/premium", headers=headers, json=payload) as resp:
-                    data = await resp.json(content_type=None) if resp.content_type else {}
-                    if resp.status >= 400:
-                        return _json_response({
-                            "error": "fragment_error",
-                            "message": data.get("message", data.get("error", "Fragment API error"))
-                        }, status=502)
-                    order_id = data.get("order_id") or data.get("id") or ""
-                    payment_url = data.get("payment_link") or data.get("payment_url") or data.get("pay_url") or ""
-                    return _json_response({
-                        "success": True, "order_id": order_id, "payment_url": payment_url or None,
-                        "order": data, "months": months, "recipient": recipient
-                    })
-        except Exception as e:
-            logger.error(f"Fragment create premium order error: {e}")
-            return _json_response({"error": "internal_error", "message": str(e)}, status=500)
+        return _json_response(
+            {
+                "error": "not_supported",
+                "message": "Premium отключён: оставлен только режим Stars через fragment.com cookies+hash.",
+            },
+            status=501,
+        )
 
     app.router.add_post("/api/fragment/create-star-order", fragment_create_star_order_handler)
     app.router.add_route("OPTIONS", "/api/fragment/create-star-order", lambda r: Response(status=204, headers=_cors_headers()))
     app.router.add_post("/api/fragment/create-premium-order", fragment_create_premium_order_handler)
     app.router.add_route("OPTIONS", "/api/fragment/create-premium-order", lambda r: Response(status=204, headers=_cors_headers()))
-
-    # Вебхук Fragment (iStar): order.completed / order.failed — сохраняем оплаченные заказы для payment_check
-    async def fragment_webhook_handler(request):
-        try:
-            body = await request.json()
-        except Exception:
-            return _json_response({"error": "invalid_payload"}, status=400)
-        event_type = body.get("event_type") or (request.headers.get("X-iStar-Event") or "").strip()
-        order = body.get("order") or {}
-        order_id = (order.get("id") or "").strip()
-        if event_type == "order.completed" and order_id:
-            completed = request.app.get("fragment_completed_orders")
-            if completed is not None:
-                completed.add(order_id)
-                logger.info(f"Fragment webhook: order {order_id} marked as completed")
-        elif event_type == "order.failed" and order_id:
-            logger.warning(f"Fragment webhook: order {order_id} failed")
-        return _json_response({"ok": True})
-    
-    app.router.add_post("/api/fragment/webhook", fragment_webhook_handler)
-    app.router.add_route("OPTIONS", "/api/fragment/webhook", lambda r: Response(status=204, headers=_cors_headers()))
 
     # Health check
     async def api_health_handler(request):
@@ -1987,38 +2801,67 @@ def setup_http_server():
             body = await request.json()
         except Exception:
             return _json_response({"error": "bad_request", "message": "Invalid JSON"}, status=400)
-        amount = body.get("amount") or body.get("total_amount")
+        amount_usdt = body.get("amount_usdt")
+        amount_rub = body.get("amount") or body.get("total_amount")
+        use_usdt = amount_usdt is not None and str(amount_usdt).strip() != ""
         try:
-            amount = float(amount)
+            if use_usdt:
+                amount = float(amount_usdt)
+            else:
+                amount = float(amount_rub) if amount_rub is not None else 0
         except (TypeError, ValueError):
-            return _json_response({"error": "bad_request", "message": "amount is required (number)"}, status=400)
-        if amount < 1:
-            return _json_response({"error": "bad_request", "message": "Minimum amount 1 RUB"}, status=400)
-        if amount > 1_000_000:
-            return _json_response({"error": "bad_request", "message": "Maximum amount 1,000,000 RUB"}, status=400)
-        description = (body.get("description") or f"Оплата {amount:.0f} ₽").strip()[:1024]
+            return _json_response({"error": "bad_request", "message": "amount or amount_usdt is required (number)"}, status=400)
+        if use_usdt:
+            if amount < 0.1:
+                return _json_response({"error": "bad_request", "message": "Minimum USDT 0.1"}, status=400)
+            if amount > 100_000:
+                return _json_response({"error": "bad_request", "message": "Maximum USDT 100,000"}, status=400)
+        else:
+            if amount < 1:
+                return _json_response({"error": "bad_request", "message": "Minimum amount 1 RUB"}, status=400)
+            if amount > 1_000_000:
+                return _json_response({"error": "bad_request", "message": "Maximum amount 1,000,000 RUB"}, status=400)
+        description = (body.get("description") or (f"Оплата {amount:.2f} USDT" if use_usdt else f"Оплата {amount:.0f} ₽")).strip()[:1024]
         payload_data = body.get("payload") or ""
         if isinstance(payload_data, dict):
             payload_data = json.dumps(payload_data, ensure_ascii=False)[:4096]
         else:
             payload_data = str(payload_data)[:4096]
 
-        # По документации Crypto Pay API: https://help.send.tg/en/articles/10279948-crypto-pay-api
-        payload_obj = {
-            "currency_type": "fiat",
-            "fiat": "RUB",
-            "amount": f"{amount:.2f}",  # Строка в формате float, напр. "125.50"
-            "description": description,
-            "accepted_assets": "USDT,TON,BTC,ETH,TRX,USDC",
-            "payload": payload_data,
-            "paid_btn_name": "callback",
-            "paid_btn_url": WEB_APP_URL or "https://jetstoreapp.ru",
-        }
+        paid_btn_url = WEB_APP_URL or "https://jetstoreapp.ru"
+        try:
+            me = await bot.get_me()
+            if me and getattr(me, "username", None):
+                paid_btn_url = f"https://t.me/{me.username}/app"
+        except Exception:
+            pass
+
+        if use_usdt:
+            payload_obj = {
+                "currency_type": "crypto",
+                "asset": "USDT",
+                "amount": f"{amount:.2f}",
+                "description": description,
+                "payload": payload_data,
+                "paid_btn_name": "callback",
+                "paid_btn_url": paid_btn_url,
+            }
+        else:
+            payload_obj = {
+                "currency_type": "fiat",
+                "fiat": "RUB",
+                "amount": f"{amount:.2f}",
+                "description": description,
+                "accepted_assets": "USDT,TON,BTC,ETH,TRX,USDC",
+                "payload": payload_data,
+                "paid_btn_name": "callback",
+                "paid_btn_url": paid_btn_url,
+            }
         headers = {
             "Content-Type": "application/json",
             "Crypto-Pay-API-Token": CRYPTO_PAY_TOKEN,
         }
-        logger.info(f"CryptoBot createInvoice: amount={amount}, fiat=RUB")
+        logger.info(f"CryptoBot createInvoice: amount={amount}, mode={'USDT' if use_usdt else 'RUB'}")
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(f"{CRYPTO_PAY_BASE}/createInvoice", headers=headers, json=payload_obj) as resp:
@@ -2136,7 +2979,7 @@ async def main():
     http_app = setup_http_server()
     runner = web.AppRunner(http_app)
     await runner.setup()
-    port = int(os.getenv("PORT", "3000"))
+    port = int(os.getenv("PORT") or "3000")
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
     print(f"🌐 HTTP API сервер запущен на порту {port}")
@@ -2152,4 +2995,8 @@ async def main():
         print(f"❌ Ошибка запуска бота: {e}")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except Exception as e:
+        logger.exception("Критическая ошибка при запуске: %s", e)
+        raise
