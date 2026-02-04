@@ -39,14 +39,25 @@ logger = logging.getLogger(__name__)
 
 # ============ НАСТРОЙКИ ============
 # Домен: Jetstoreapp.ru
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8528977779:AAHbPeWIA8rNuDyHc_eI7F7c2qr3M8Xw3_o")
-ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "6928639672").split(",") if x.strip()]
-WEB_APP_URL = os.getenv("WEB_APP_URL", "https://jetstoreapp.ru")
-ADM_WEB_APP_URL = os.getenv("ADM_WEB_APP_URL", "https://jetstoreapp.ru/html/admin.html")
+# ВАЖНО: Все переменные читаются ТОЛЬКО из переменных окружения (Railway/Render)
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN не задан в переменных окружения")
+ADMIN_IDS_STR = os.getenv("ADMIN_IDS", "").strip()
+if not ADMIN_IDS_STR:
+    raise ValueError("ADMIN_IDS не задан в переменных окружения")
+ADMIN_IDS = [int(x) for x in ADMIN_IDS_STR.split(",") if x.strip()]
+WEB_APP_URL = os.getenv("WEB_APP_URL", "").strip()
+if not WEB_APP_URL:
+    raise ValueError("WEB_APP_URL не задан в переменных окружения")
+ADM_WEB_APP_URL = os.getenv("ADM_WEB_APP_URL", "").strip() or f"{WEB_APP_URL}/html/admin.html"
 
 # Группа/чат, куда слать уведомления о продаже звёзд
-SELL_STARS_NOTIFY_CHAT_ID = int(os.getenv("SELL_STARS_NOTIFY_CHAT_ID", "0") or "0")
-TON_NOTIFY_CHAT_ID = int(os.getenv("TON_NOTIFY_CHAT_ID", "0") or "0")
+# ВАЖНО: Эти переменные читаются ТОЛЬКО из переменных окружения
+SELL_STARS_NOTIFY_CHAT_ID_STR = os.getenv("SELL_STARS_NOTIFY_CHAT_ID", "").strip()
+SELL_STARS_NOTIFY_CHAT_ID = int(SELL_STARS_NOTIFY_CHAT_ID_STR) if SELL_STARS_NOTIFY_CHAT_ID_STR else 0
+TON_NOTIFY_CHAT_ID_STR = os.getenv("TON_NOTIFY_CHAT_ID", "").strip()
+TON_NOTIFY_CHAT_ID = int(TON_NOTIFY_CHAT_ID_STR) if TON_NOTIFY_CHAT_ID_STR else 0
 
 # Курс выплаты за 1 звезду (RUB), используем тот же, что в мини-аппе
 STAR_BUY_RATE_RUB = float(os.getenv("STAR_BUY_RATE_RUB", "0.65") or "0.65")
@@ -65,7 +76,9 @@ REFERRALS: dict[str, dict] = {}
 REFERRALS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "referrals_data.json")
 
 # Чат, куда слать заявки на вывод реферальных средств
-REFERRAL_WITHDRAW_CHAT_ID = int(os.getenv("REFERRAL_WITHDRAW_CHAT_ID", "0") or "0")
+# ВАЖНО: REFERRAL_WITHDRAW_CHAT_ID читается ТОЛЬКО из переменных окружения
+REFERRAL_WITHDRAW_CHAT_ID_STR = os.getenv("REFERRAL_WITHDRAW_CHAT_ID", "").strip()
+REFERRAL_WITHDRAW_CHAT_ID = int(REFERRAL_WITHDRAW_CHAT_ID_STR) if REFERRAL_WITHDRAW_CHAT_ID_STR else 0
 
 # ============ USERBOT (Telethon / MTProto) ============
 # Чтобы искать любого пользователя по @username без /start, нужен userbot:
@@ -1722,7 +1735,8 @@ def setup_http_server():
     app.router.add_get('/api/ton-rate', ton_rate_handler)
     app.router.add_route('OPTIONS', '/api/ton-rate', lambda r: Response(status=204, headers=_cors_headers()))
 
-    TON_PAYMENT_ADDRESS = {"value": (os.getenv("TON_PAYMENT_ADDRESS") or "").strip()}
+    # ВАЖНО: TON_PAYMENT_ADDRESS читается ТОЛЬКО из переменных окружения
+    TON_PAYMENT_ADDRESS = {"value": _get_env_clean("TON_PAYMENT_ADDRESS") or ""}
 
     async def _get_ton_rate_rub() -> float:
         try:
@@ -2344,8 +2358,12 @@ def setup_http_server():
     app.router.add_get("/api/donatehub/order/{id}", donatehub_order_status_handler)
     
     # Crypto Pay (CryptoBot)
+    # ВАЖНО: CRYPTO_PAY_TOKEN читается ТОЛЬКО из переменных окружения
     _cryptobot_cfg_early = _read_json_file(os.path.join(os.path.dirname(os.path.abspath(__file__)), "cryptobot_config.json"))
-    CRYPTO_PAY_TOKEN = _get_env_clean("CRYPTO_PAY_TOKEN") or _cryptobot_cfg_early.get("api_token", "")
+    CRYPTO_PAY_TOKEN = _get_env_clean("CRYPTO_PAY_TOKEN")
+    if not CRYPTO_PAY_TOKEN:
+        CRYPTO_PAY_TOKEN = _cryptobot_cfg_early.get("api_token", "") or ""
+    CRYPTO_PAY_TOKEN = CRYPTO_PAY_TOKEN.strip()
     CRYPTO_PAY_BASE = "https://pay.crypt.bot/api"
 
     # Fragment.com (сайт) — вызов fragment.com/api через cookies + hash (как в ezstar).
@@ -2361,20 +2379,22 @@ def setup_http_server():
         logger.warning("fragment_site_config.json не найден (искали в %s и cwd); задайте TONAPI_KEY и MNEMONIC в переменных окружения", _script_dir)
     if not TON_PAYMENT_ADDRESS.get("value") and _fragment_site_cfg:
         TON_PAYMENT_ADDRESS["value"] = str(_fragment_site_cfg.get("ton_payment_address") or "").strip()
-    FRAGMENT_SITE_COOKIES = (
-        _get_env_clean("FRAGMENT_SITE_COOKIES")
-        or _get_env_clean("FRAGMENT_COOKIES")
-        or str(_fragment_site_cfg.get("cookies", "") or "").strip()
-    )
-    FRAGMENT_SITE_HASH = (
-        _get_env_clean("FRAGMENT_SITE_HASH")
-        or _get_env_clean("FRAGMENT_HASH")
-        or str(_fragment_site_cfg.get("hash", "") or "").strip()
-    )
+    # ВАЖНО: FRAGMENT переменные читаются ТОЛЬКО из переменных окружения
+    FRAGMENT_SITE_COOKIES = _get_env_clean("FRAGMENT_SITE_COOKIES") or _get_env_clean("FRAGMENT_COOKIES") or ""
+    if not FRAGMENT_SITE_COOKIES and _fragment_site_cfg:
+        FRAGMENT_SITE_COOKIES = str(_fragment_site_cfg.get("cookies", "") or "").strip()
+    FRAGMENT_SITE_HASH = _get_env_clean("FRAGMENT_SITE_HASH") or _get_env_clean("FRAGMENT_HASH") or ""
+    if not FRAGMENT_SITE_HASH and _fragment_site_cfg:
+        FRAGMENT_SITE_HASH = str(_fragment_site_cfg.get("hash", "") or "").strip()
     FRAGMENT_SITE_ENABLED = bool(FRAGMENT_SITE_COOKIES and FRAGMENT_SITE_HASH)
     # TON-кошелёк бота для отправки TON в Fragment (как в ezstar: бот сам платит Fragment, звёзды приходят получателю).
-    TONAPI_KEY = _get_env_clean("TONAPI_KEY") or str(_fragment_site_cfg.get("tonapi_key", "") or "").strip()
-    _mnemonic_raw = _get_env_clean("MNEMONIC") or _fragment_site_cfg.get("mnemonic")
+    # ВАЖНО: TONAPI_KEY и MNEMONIC читаются ТОЛЬКО из переменных окружения
+    TONAPI_KEY = _get_env_clean("TONAPI_KEY") or ""
+    if not TONAPI_KEY and _fragment_site_cfg:
+        TONAPI_KEY = str(_fragment_site_cfg.get("tonapi_key", "") or "").strip()
+    _mnemonic_raw = _get_env_clean("MNEMONIC") or ""
+    if not _mnemonic_raw and _fragment_site_cfg:
+        _mnemonic_raw = _fragment_site_cfg.get("mnemonic") or ""
     if isinstance(_mnemonic_raw, str):
         MNEMONIC = [s.strip() for s in _mnemonic_raw.replace(",", " ").split() if s.strip()] if _mnemonic_raw else []
     elif isinstance(_mnemonic_raw, list):
