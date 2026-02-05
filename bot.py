@@ -39,25 +39,14 @@ logger = logging.getLogger(__name__)
 
 # ============ НАСТРОЙКИ ============
 # Домен: Jetstoreapp.ru
-# ВАЖНО: Все переменные читаются ТОЛЬКО из переменных окружения (Railway/Render)
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN не задан в переменных окружения")
-ADMIN_IDS_STR = os.getenv("ADMIN_IDS", "").strip()
-if not ADMIN_IDS_STR:
-    raise ValueError("ADMIN_IDS не задан в переменных окружения")
-ADMIN_IDS = [int(x) for x in ADMIN_IDS_STR.split(",") if x.strip()]
-WEB_APP_URL = os.getenv("WEB_APP_URL", "").strip()
-if not WEB_APP_URL:
-    raise ValueError("WEB_APP_URL не задан в переменных окружения")
-ADM_WEB_APP_URL = os.getenv("ADM_WEB_APP_URL", "").strip() or f"{WEB_APP_URL}/html/admin.html"
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8528977779:AAHbPeWIA8rNuDyHc_eI7F7c2qr3M8Xw3_o")
+ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "6928639672").split(",") if x.strip()]
+WEB_APP_URL = os.getenv("WEB_APP_URL", "https://jetstoreapp.ru")
+ADM_WEB_APP_URL = os.getenv("ADM_WEB_APP_URL", "https://jetstoreapp.ru/html/admin.html")
 
 # Группа/чат, куда слать уведомления о продаже звёзд
-# ВАЖНО: Эти переменные читаются ТОЛЬКО из переменных окружения
-SELL_STARS_NOTIFY_CHAT_ID_STR = os.getenv("SELL_STARS_NOTIFY_CHAT_ID", "").strip()
-SELL_STARS_NOTIFY_CHAT_ID = int(SELL_STARS_NOTIFY_CHAT_ID_STR) if SELL_STARS_NOTIFY_CHAT_ID_STR else 0
-TON_NOTIFY_CHAT_ID_STR = os.getenv("TON_NOTIFY_CHAT_ID", "").strip()
-TON_NOTIFY_CHAT_ID = int(TON_NOTIFY_CHAT_ID_STR) if TON_NOTIFY_CHAT_ID_STR else 0
+SELL_STARS_NOTIFY_CHAT_ID = int(os.getenv("SELL_STARS_NOTIFY_CHAT_ID", "0") or "0")
+TON_NOTIFY_CHAT_ID = int(os.getenv("TON_NOTIFY_CHAT_ID", "0") or "0")
 
 # Курс выплаты за 1 звезду (RUB), используем тот же, что в мини-аппе
 STAR_BUY_RATE_RUB = float(os.getenv("STAR_BUY_RATE_RUB", "0.65") or "0.65")
@@ -76,9 +65,7 @@ REFERRALS: dict[str, dict] = {}
 REFERRALS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "referrals_data.json")
 
 # Чат, куда слать заявки на вывод реферальных средств
-# ВАЖНО: REFERRAL_WITHDRAW_CHAT_ID читается ТОЛЬКО из переменных окружения
-REFERRAL_WITHDRAW_CHAT_ID_STR = os.getenv("REFERRAL_WITHDRAW_CHAT_ID", "").strip()
-REFERRAL_WITHDRAW_CHAT_ID = int(REFERRAL_WITHDRAW_CHAT_ID_STR) if REFERRAL_WITHDRAW_CHAT_ID_STR else 0
+REFERRAL_WITHDRAW_CHAT_ID = int(os.getenv("REFERRAL_WITHDRAW_CHAT_ID", "0") or "0")
 
 # ============ USERBOT (Telethon / MTProto) ============
 # Чтобы искать любого пользователя по @username без /start, нужен userbot:
@@ -1735,40 +1722,7 @@ def setup_http_server():
     app.router.add_get('/api/ton-rate', ton_rate_handler)
     app.router.add_route('OPTIONS', '/api/ton-rate', lambda r: Response(status=204, headers=_cors_headers()))
 
-    async def usdt_ton_rate_handler(request):
-        """Курс USDT→TON через CoinPaprika (для конвертации USDT платежей в рубли)."""
-        try:
-            async with aiohttp.ClientSession() as session:
-                # Получаем курс USDT→RUB и TON→RUB, затем вычисляем USDT→TON
-                async with session.get("https://api.coinpaprika.com/v1/tickers/usdt-tether?quotes=RUB") as usdt_resp:
-                    usdt_data = await usdt_resp.json(content_type=None) if usdt_resp.content_type else {}
-                async with session.get("https://api.coinpaprika.com/v1/tickers/ton-toncoin?quotes=RUB") as ton_resp:
-                    ton_data = await ton_resp.json(content_type=None) if ton_resp.content_type else {}
-            usdt_rub = None
-            ton_rub = None
-            if usdt_data and usdt_data.get("quotes") and usdt_data["quotes"].get("RUB"):
-                usdt_rub = float(usdt_data["quotes"]["RUB"].get("price", 0) or 0)
-            if ton_data and ton_data.get("quotes") and ton_data["quotes"].get("RUB"):
-                ton_rub = float(ton_data["quotes"]["RUB"].get("price", 0) or 0)
-            if not usdt_rub or usdt_rub <= 0:
-                usdt_rub = 100.0  # Fallback: ~100 RUB за USDT
-            if not ton_rub or ton_rub <= 0:
-                ton_rub = 600.0  # Fallback: ~600 RUB за TON
-            usdt_ton = ton_rub / usdt_rub if usdt_rub > 0 else 6.0  # Fallback: ~6 TON за USDT
-            return _json_response({
-                "USDT_RUB": round(usdt_rub, 2),
-                "TON_RUB": round(ton_rub, 2),
-                "USDT_TON": round(usdt_ton, 6)
-            })
-        except Exception as e:
-            logger.warning(f"USDT/TON rate fetch error: {e}")
-            return _json_response({"USDT_RUB": 100.0, "TON_RUB": 600.0, "USDT_TON": 6.0})
-
-    app.router.add_get('/api/usdt-ton-rate', usdt_ton_rate_handler)
-    app.router.add_route('OPTIONS', '/api/usdt-ton-rate', lambda r: Response(status=204, headers=_cors_headers()))
-
-    # ВАЖНО: TON_PAYMENT_ADDRESS читается ТОЛЬКО из переменных окружения
-    TON_PAYMENT_ADDRESS = {"value": _get_env_clean("TON_PAYMENT_ADDRESS") or ""}
+    TON_PAYMENT_ADDRESS = {"value": (os.getenv("TON_PAYMENT_ADDRESS") or "").strip()}
 
     async def _get_ton_rate_rub() -> float:
         try:
@@ -2020,11 +1974,11 @@ def setup_http_server():
         volume_ton = round(volume_rub / ton_rate, 6) if volume_rub > 0 else 0.0
 
         # Уровни JetRefs по объёму в TON:
-        # 1 уровень: 0–999.99 TON
-        # 2 уровень: 1000–4999.99 TON
-        # 3 уровень: 5000+ TON
-        L2_TON = 1000.0
-        L3_TON = 5000.0
+        # 1 уровень: 0–4999.99 TON
+        # 2 уровень: 5000–14999.99 TON
+        # 3 уровень: 15000+ TON
+        L2_TON = 5000.0
+        L3_TON = 15000.0
         max_level = 3
         if volume_ton >= L3_TON:
             level = 3
@@ -2044,7 +1998,6 @@ def setup_http_server():
             progress_percent = int(round(min(1.0, done / span) * 100))
             remaining_ton = max(0.0, target - volume_ton)
             to_next_volume_rub = remaining_ton * ton_rate
-            to_next_volume_ton = remaining_ton  # Добавляем также в TON для удобства
 
         payload = {
             "user_id": uid,
@@ -2060,7 +2013,6 @@ def setup_http_server():
             "max_level": max_level,
             "progress_percent": progress_percent,
             "to_next_volume_rub": round(to_next_volume_rub, 2),
-            "to_next_volume_ton": round(remaining_ton, 2) if level < max_level else 0.0,
             "ton_rate_rub": ton_rate,
         }
         return _json_response(payload)
@@ -2094,11 +2046,11 @@ def setup_http_server():
         if amount <= 0:
             return _json_response({"error": "bad_request", "message": "amount_rub должен быть > 0"}, status=400)
 
-        # Минимальная сумма вывода: 25 TON (в рублях по текущему курсу)
+        # Минимальная сумма вывода: эквивалент 25 TON в рублях
         try:
             ton_rate = await _get_ton_rate_rub()
         except Exception:
-            ton_rate = 600.0  # fallback, как в ton_rate_handler
+            ton_rate = 600.0
         min_ton = 25.0
         min_rub = float(min_ton * (ton_rate or 600.0))
         if amount + 1e-6 < min_rub:
@@ -2156,32 +2108,6 @@ def setup_http_server():
 
     app.router.add_post("/api/referral/withdraw", referral_withdraw_handler)
     app.router.add_route("OPTIONS", "/api/referral/withdraw", lambda r: Response(status=204, headers=_cors_headers()))
-
-    async def referral_link_handler(request):
-        """
-        Простейшая реферальная ссылка формата:
-        https://t.me/<bot_username>?start=ref_<user_id>
-        GET /api/referral/link?user_id=...
-        """
-        user_id = request.rel_url.query.get("user_id", "").strip()
-        if not user_id:
-            return _json_response({"error": "bad_request", "message": "user_id required"}, status=400)
-        try:
-            uid = str(int(user_id))
-        except Exception:
-            uid = str(user_id)
-
-        try:
-            me = await bot.get_me()
-            bot_username = me.username or "JetSold_bot"
-        except Exception:
-            bot_username = "JetSold_bot"
-
-        url = f"https://t.me/{bot_username}?start=ref_{uid}"
-        return _json_response({"url": url, "user_id": uid, "bot_username": bot_username})
-
-    app.router.add_get("/api/referral/link", referral_link_handler)
-    app.router.add_route("OPTIONS", "/api/referral/link", lambda r: Response(status=204, headers=_cors_headers()))
 
     # Продажа звёзд из мини-приложения: создать счёт XTR и сохранить данные выплаты
     async def sellstars_create_invoice_handler(request):
@@ -2408,12 +2334,8 @@ def setup_http_server():
     app.router.add_get("/api/donatehub/order/{id}", donatehub_order_status_handler)
     
     # Crypto Pay (CryptoBot)
-    # ВАЖНО: CRYPTO_PAY_TOKEN читается ТОЛЬКО из переменных окружения
     _cryptobot_cfg_early = _read_json_file(os.path.join(os.path.dirname(os.path.abspath(__file__)), "cryptobot_config.json"))
-    CRYPTO_PAY_TOKEN = _get_env_clean("CRYPTO_PAY_TOKEN")
-    if not CRYPTO_PAY_TOKEN:
-        CRYPTO_PAY_TOKEN = _cryptobot_cfg_early.get("api_token", "") or ""
-    CRYPTO_PAY_TOKEN = CRYPTO_PAY_TOKEN.strip()
+    CRYPTO_PAY_TOKEN = _get_env_clean("CRYPTO_PAY_TOKEN") or _cryptobot_cfg_early.get("api_token", "")
     CRYPTO_PAY_BASE = "https://pay.crypt.bot/api"
 
     # Fragment.com (сайт) — вызов fragment.com/api через cookies + hash (как в ezstar).
@@ -2429,22 +2351,20 @@ def setup_http_server():
         logger.warning("fragment_site_config.json не найден (искали в %s и cwd); задайте TONAPI_KEY и MNEMONIC в переменных окружения", _script_dir)
     if not TON_PAYMENT_ADDRESS.get("value") and _fragment_site_cfg:
         TON_PAYMENT_ADDRESS["value"] = str(_fragment_site_cfg.get("ton_payment_address") or "").strip()
-    # ВАЖНО: FRAGMENT переменные читаются ТОЛЬКО из переменных окружения
-    FRAGMENT_SITE_COOKIES = _get_env_clean("FRAGMENT_SITE_COOKIES") or _get_env_clean("FRAGMENT_COOKIES") or ""
-    if not FRAGMENT_SITE_COOKIES and _fragment_site_cfg:
-        FRAGMENT_SITE_COOKIES = str(_fragment_site_cfg.get("cookies", "") or "").strip()
-    FRAGMENT_SITE_HASH = _get_env_clean("FRAGMENT_SITE_HASH") or _get_env_clean("FRAGMENT_HASH") or ""
-    if not FRAGMENT_SITE_HASH and _fragment_site_cfg:
-        FRAGMENT_SITE_HASH = str(_fragment_site_cfg.get("hash", "") or "").strip()
+    FRAGMENT_SITE_COOKIES = (
+        _get_env_clean("FRAGMENT_SITE_COOKIES")
+        or _get_env_clean("FRAGMENT_COOKIES")
+        or str(_fragment_site_cfg.get("cookies", "") or "").strip()
+    )
+    FRAGMENT_SITE_HASH = (
+        _get_env_clean("FRAGMENT_SITE_HASH")
+        or _get_env_clean("FRAGMENT_HASH")
+        or str(_fragment_site_cfg.get("hash", "") or "").strip()
+    )
     FRAGMENT_SITE_ENABLED = bool(FRAGMENT_SITE_COOKIES and FRAGMENT_SITE_HASH)
     # TON-кошелёк бота для отправки TON в Fragment (как в ezstar: бот сам платит Fragment, звёзды приходят получателю).
-    # ВАЖНО: TONAPI_KEY и MNEMONIC читаются ТОЛЬКО из переменных окружения
-    TONAPI_KEY = _get_env_clean("TONAPI_KEY") or ""
-    if not TONAPI_KEY and _fragment_site_cfg:
-        TONAPI_KEY = str(_fragment_site_cfg.get("tonapi_key", "") or "").strip()
-    _mnemonic_raw = _get_env_clean("MNEMONIC") or ""
-    if not _mnemonic_raw and _fragment_site_cfg:
-        _mnemonic_raw = _fragment_site_cfg.get("mnemonic") or ""
+    TONAPI_KEY = _get_env_clean("TONAPI_KEY") or str(_fragment_site_cfg.get("tonapi_key", "") or "").strip()
+    _mnemonic_raw = _get_env_clean("MNEMONIC") or _fragment_site_cfg.get("mnemonic")
     if isinstance(_mnemonic_raw, str):
         MNEMONIC = [s.strip() for s in _mnemonic_raw.replace(",", " ").split() if s.strip()] if _mnemonic_raw else []
     elif isinstance(_mnemonic_raw, list):
@@ -2705,58 +2625,19 @@ def setup_http_server():
                                         paid_invoice = inv
                                         break
                                 if paid_invoice:
-                                    # Сумма в рублях для реферальной системы
+                                    # Сумма в рублях для реферальной системы:
+                                    # берём из тела запроса (baseAmount/totalAmount), т.к. инвойс создавали в RUB
                                     amount_rub = None
-                                    currency_type = (paid_invoice.get("currency_type") or "").strip().lower()
-                                    asset = (paid_invoice.get("asset") or "").strip().upper()
-                                    # Разные варианты полей в ответе Crypto Pay API
-                                    paid_amount = (
-                                        paid_invoice.get("paid_amount")
-                                        or paid_invoice.get("amount")
-                                        or paid_invoice.get("amount_usdt")
-                                        or paid_invoice.get("pay_amount")
-                                    )
-                                    
-                                    # USDT-платеж: конвертируем в рубли по курсу CoinPaprika
-                                    if (currency_type == "crypto" and asset == "USDT" and paid_amount) or (
-                                        paid_amount and (asset == "USDT" or "usdt" in str(paid_invoice.get("asset", "")).lower())
-                                    ):
-                                        try:
-                                            async with session.get("https://api.coinpaprika.com/v1/tickers/usdt-tether?quotes=RUB") as rate_resp:
-                                                rate_data = await rate_resp.json(content_type=None) if rate_resp.content_type else {}
-                                            usdt_rub_rate = None
-                                            if rate_data and rate_data.get("quotes") and rate_data["quotes"].get("RUB"):
-                                                usdt_rub_rate = float(rate_data["quotes"]["RUB"].get("price", 0) or 0)
-                                            if usdt_rub_rate and usdt_rub_rate > 0:
-                                                amount_usdt = float(paid_amount)
-                                                amount_rub = round(amount_usdt * usdt_rub_rate, 2)
-                                                logger.info(f"CryptoBot USDT payment: {amount_usdt} USDT = {amount_rub} RUB (rate: {usdt_rub_rate})")
-                                            else:
-                                                amount_rub = round(float(paid_amount) * 100.0, 2)  # Fallback: ~100 RUB за USDT
-                                        except Exception as e:
-                                            logger.warning(f"USDT rate fetch error: {e}")
-                                            amount_rub = round(float(paid_amount) * 100.0, 2)  # Fallback
-                                    # Fiat (RUB) инвойс — сумма уже в рублях
-                                    elif currency_type == "fiat" and paid_amount:
-                                        try:
-                                            amount_rub = round(float(paid_amount), 2)
-                                        except (TypeError, ValueError):
-                                            amount_rub = None
-                                    
-                                    # Если не удалось получить amount_rub из инвойса — берём из тела запроса (фронт передаёт baseAmount/totalAmount)
-                                    if amount_rub is None or amount_rub <= 0:
-                                        req_base = body.get("baseAmount") or body.get("base_amount")
-                                        req_total = body.get("totalAmount") or body.get("total_amount")
-                                        try:
-                                            if req_base is not None:
-                                                amount_rub = round(float(req_base), 2)
-                                            elif req_total is not None:
-                                                amount_rub = round(float(req_total), 2)
-                                        except (TypeError, ValueError):
-                                            pass
-                                        if amount_rub and amount_rub > 0:
-                                            logger.info(f"CryptoBot amount_rub from request body: {amount_rub}")
-                                    
+                                    base_req = body.get("baseAmount") or body.get("base_amount")
+                                    total_req = body.get("totalAmount") or body.get("total_amount")
+                                    try:
+                                        if base_req is not None:
+                                            amount_rub = round(float(base_req), 2)
+                                        elif total_req is not None:
+                                            amount_rub = round(float(total_req), 2)
+                                    except (TypeError, ValueError):
+                                        amount_rub = None
+
                                     response_data = {"paid": True, "invoice_id": invoice_id}
                                     if amount_rub and amount_rub > 0:
                                         response_data["amount_rub"] = amount_rub
