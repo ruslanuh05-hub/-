@@ -1735,6 +1735,38 @@ def setup_http_server():
     app.router.add_get('/api/ton-rate', ton_rate_handler)
     app.router.add_route('OPTIONS', '/api/ton-rate', lambda r: Response(status=204, headers=_cors_headers()))
 
+    async def usdt_ton_rate_handler(request):
+        """Курс USDT→TON через CoinPaprika (для конвертации USDT платежей в рубли)."""
+        try:
+            async with aiohttp.ClientSession() as session:
+                # Получаем курс USDT→RUB и TON→RUB, затем вычисляем USDT→TON
+                async with session.get("https://api.coinpaprika.com/v1/tickers/usdt-tether?quotes=RUB") as usdt_resp:
+                    usdt_data = await usdt_resp.json(content_type=None) if usdt_resp.content_type else {}
+                async with session.get("https://api.coinpaprika.com/v1/tickers/ton-toncoin?quotes=RUB") as ton_resp:
+                    ton_data = await ton_resp.json(content_type=None) if ton_resp.content_type else {}
+            usdt_rub = None
+            ton_rub = None
+            if usdt_data and usdt_data.get("quotes") and usdt_data["quotes"].get("RUB"):
+                usdt_rub = float(usdt_data["quotes"]["RUB"].get("price", 0) or 0)
+            if ton_data and ton_data.get("quotes") and ton_data["quotes"].get("RUB"):
+                ton_rub = float(ton_data["quotes"]["RUB"].get("price", 0) or 0)
+            if not usdt_rub or usdt_rub <= 0:
+                usdt_rub = 100.0  # Fallback: ~100 RUB за USDT
+            if not ton_rub or ton_rub <= 0:
+                ton_rub = 600.0  # Fallback: ~600 RUB за TON
+            usdt_ton = ton_rub / usdt_rub if usdt_rub > 0 else 6.0  # Fallback: ~6 TON за USDT
+            return _json_response({
+                "USDT_RUB": round(usdt_rub, 2),
+                "TON_RUB": round(ton_rub, 2),
+                "USDT_TON": round(usdt_ton, 6)
+            })
+        except Exception as e:
+            logger.warning(f"USDT/TON rate fetch error: {e}")
+            return _json_response({"USDT_RUB": 100.0, "TON_RUB": 600.0, "USDT_TON": 6.0})
+
+    app.router.add_get('/api/usdt-ton-rate', usdt_ton_rate_handler)
+    app.router.add_route('OPTIONS', '/api/usdt-ton-rate', lambda r: Response(status=204, headers=_cors_headers()))
+
     # ВАЖНО: TON_PAYMENT_ADDRESS читается ТОЛЬКО из переменных окружения
     TON_PAYMENT_ADDRESS = {"value": _get_env_clean("TON_PAYMENT_ADDRESS") or ""}
 
@@ -2061,6 +2093,24 @@ def setup_http_server():
 
         if amount <= 0:
             return _json_response({"error": "bad_request", "message": "amount_rub должен быть > 0"}, status=400)
+
+        # Минимальная сумма вывода: 25 TON (в рублях по текущему курсу)
+        try:
+            ton_rate = await _get_ton_rate_rub()
+        except Exception:
+            ton_rate = 600.0  # fallback, как в ton_rate_handler
+        min_ton = 25.0
+        min_rub = float(min_ton * (ton_rate or 600.0))
+        if amount + 1e-6 < min_rub:
+            return _json_response(
+                {
+                    "error": "too_small",
+                    "message": f"Минимальная сумма вывода 25 TON (~{min_rub:.2f} ₽)",
+                    "min_ton": min_ton,
+                    "min_rub": round(min_rub, 2),
+                },
+                status=400,
+            )
 
         _load_referrals()
         ref = _get_or_create_ref_user(uid)
@@ -2649,12 +2699,68 @@ def setup_http_server():
                             elif isinstance(result, list):
                                 items = result
                             if isinstance(items, list):
-                                paid = any(
-                                    str(inv.get("invoice_id")) == str(invoice_id) and inv.get("status") == "paid"
-                                    for inv in items if isinstance(inv, dict)
-                                )
-                                if paid:
-                                    return _json_response({"paid": True, "invoice_id": invoice_id})
+                                paid_invoice = None
+                                for inv in items:
+                                    if isinstance(inv, dict) and str(inv.get("invoice_id")) == str(invoice_id) and inv.get("status") == "paid":
+                                        paid_invoice = inv
+                                        break
+                                if paid_invoice:
+                                    # Сумма в рублях для реферальной системы
+                                    amount_rub = None
+                                    currency_type = (paid_invoice.get("currency_type") or "").strip().lower()
+                                    asset = (paid_invoice.get("asset") or "").strip().upper()
+                                    # Разные варианты полей в ответе Crypto Pay API
+                                    paid_amount = (
+                                        paid_invoice.get("paid_amount")
+                                        or paid_invoice.get("amount")
+                                        or paid_invoice.get("amount_usdt")
+                                        or paid_invoice.get("pay_amount")
+                                    )
+                                    
+                                    # USDT-платеж: конвертируем в рубли по курсу CoinPaprika
+                                    if (currency_type == "crypto" and asset == "USDT" and paid_amount) or (
+                                        paid_amount and (asset == "USDT" or "usdt" in str(paid_invoice.get("asset", "")).lower())
+                                    ):
+                                        try:
+                                            async with session.get("https://api.coinpaprika.com/v1/tickers/usdt-tether?quotes=RUB") as rate_resp:
+                                                rate_data = await rate_resp.json(content_type=None) if rate_resp.content_type else {}
+                                            usdt_rub_rate = None
+                                            if rate_data and rate_data.get("quotes") and rate_data["quotes"].get("RUB"):
+                                                usdt_rub_rate = float(rate_data["quotes"]["RUB"].get("price", 0) or 0)
+                                            if usdt_rub_rate and usdt_rub_rate > 0:
+                                                amount_usdt = float(paid_amount)
+                                                amount_rub = round(amount_usdt * usdt_rub_rate, 2)
+                                                logger.info(f"CryptoBot USDT payment: {amount_usdt} USDT = {amount_rub} RUB (rate: {usdt_rub_rate})")
+                                            else:
+                                                amount_rub = round(float(paid_amount) * 100.0, 2)  # Fallback: ~100 RUB за USDT
+                                        except Exception as e:
+                                            logger.warning(f"USDT rate fetch error: {e}")
+                                            amount_rub = round(float(paid_amount) * 100.0, 2)  # Fallback
+                                    # Fiat (RUB) инвойс — сумма уже в рублях
+                                    elif currency_type == "fiat" and paid_amount:
+                                        try:
+                                            amount_rub = round(float(paid_amount), 2)
+                                        except (TypeError, ValueError):
+                                            amount_rub = None
+                                    
+                                    # Если не удалось получить amount_rub из инвойса — берём из тела запроса (фронт передаёт baseAmount/totalAmount)
+                                    if amount_rub is None or amount_rub <= 0:
+                                        req_base = body.get("baseAmount") or body.get("base_amount")
+                                        req_total = body.get("totalAmount") or body.get("total_amount")
+                                        try:
+                                            if req_base is not None:
+                                                amount_rub = round(float(req_base), 2)
+                                            elif req_total is not None:
+                                                amount_rub = round(float(req_total), 2)
+                                        except (TypeError, ValueError):
+                                            pass
+                                        if amount_rub and amount_rub > 0:
+                                            logger.info(f"CryptoBot amount_rub from request body: {amount_rub}")
+                                    
+                                    response_data = {"paid": True, "invoice_id": invoice_id}
+                                    if amount_rub and amount_rub > 0:
+                                        response_data["amount_rub"] = amount_rub
+                                    return _json_response(response_data)
             except Exception as e:
                 logger.warning(f"Crypto Pay check invoice {invoice_id}: {e}")
         if invoice_id and method == "cryptobot":
