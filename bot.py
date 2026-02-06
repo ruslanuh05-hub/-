@@ -64,6 +64,40 @@ PENDING_SELL_STARS_ORDERS: dict[str, dict] = {}
 REFERRALS: dict[str, dict] = {}
 REFERRALS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "referrals_data.json")
 
+# Ключ для шифрования ID в реферальной ссылке (без ключа — fallback к открытому ID)
+REFERRAL_ENC_KEY = (os.getenv("REFERRAL_ENC_KEY", "jet_ref_2024_secret") or "").encode()[:32].ljust(32, b"0")
+
+
+def _encrypt_ref_id(user_id: int) -> str:
+    """Шифрует user_id для реферальной ссылки (XOR + base64)."""
+    try:
+        s = str(user_id).encode()
+        key = REFERRAL_ENC_KEY or b"jet_ref_default_key_32bytes!!"
+        enc = bytes(s[i] ^ key[i % len(key)] for i in range(len(s)))
+        return base64.urlsafe_b64encode(enc).decode().rstrip("=")
+    except Exception:
+        return str(user_id)
+
+
+def _decrypt_ref_id(enc: str) -> Optional[int]:
+    """Расшифровывает ref-параметр. При ошибке — пробует int(enc) для старых ссылок."""
+    if not enc:
+        return None
+    try:
+        raw = enc
+        if len(raw) % 4:
+            raw += "=" * (4 - len(raw) % 4)
+        data = base64.urlsafe_b64decode(raw)
+        key = REFERRAL_ENC_KEY or b"jet_ref_default_key_32bytes!!"
+        dec = bytes(data[i] ^ key[i % len(key)] for i in range(len(data)))
+        return int(dec.decode())
+    except Exception:
+        try:
+            return int(enc)
+        except (ValueError, TypeError):
+            return None
+
+
 # Чат, куда слать заявки на вывод реферальных средств
 REFERRAL_WITHDRAW_CHAT_ID = int(os.getenv("REFERRAL_WITHDRAW_CHAT_ID", "0") or "0")
 
@@ -182,7 +216,9 @@ async def _process_referral_start(user_id: int, start_text: str | None) -> Optio
         inviter_raw = arg[4:].strip()
         if not inviter_raw:
             return None
-        inviter_id = int(inviter_raw)
+        inviter_id = _decrypt_ref_id(inviter_raw)
+        if inviter_id is None:
+            return None
     except Exception:
         return None
 
@@ -2051,6 +2087,30 @@ def setup_http_server():
     app.router.add_get("/api/referral/stats", referral_stats_handler)
     app.router.add_route("OPTIONS", "/api/referral/stats", lambda r: Response(status=204, headers=_cors_headers()))
 
+    async def referral_link_handler(request):
+        """
+        Реферальная ссылка с зашифрованным ID.
+        GET /api/referral/link?user_id=...
+        """
+        user_id = request.rel_url.query.get("user_id", "").strip()
+        if not user_id:
+            return _json_response({"error": "bad_request", "message": "user_id required"}, status=400)
+        try:
+            uid = int(user_id)
+        except (ValueError, TypeError):
+            return _json_response({"error": "bad_request", "message": "user_id must be integer"}, status=400)
+        try:
+            me = await bot.get_me()
+            bot_username = me.username or "JetStoreApp_bot"
+        except Exception:
+            bot_username = "JetStoreApp_bot"
+        ref_code = _encrypt_ref_id(uid)
+        url = f"https://t.me/{bot_username}?start=ref_{ref_code}"
+        return _json_response({"url": url})
+
+    app.router.add_get("/api/referral/link", referral_link_handler)
+    app.router.add_route("OPTIONS", "/api/referral/link", lambda r: Response(status=204, headers=_cors_headers()))
+
     async def referral_withdraw_handler(request):
         """
         Создание заявки на вывод реферальных средств.
@@ -3132,8 +3192,9 @@ def setup_http_server():
     async def purchases_record_handler(request):
         """
         POST /api/purchases/record
-        Сохраняет покупку в users_data.json, начисляет рефералам.
-        JSON: { user_id, amount_rub, stars_amount?, type?, productName? }
+        Сохраняет покупку в users_data.json (для рейтинга), начисляет рефералам.
+        JSON: { user_id, amount_rub, stars_amount?, type?, productName?, rating_only?, referral_only? }
+        rating_only=True — только рейтинг (при отправке денег), referral_only=True — только рефералы (при успешной оплате)
         """
         try:
             body = await request.json() if request.can_read_body else {}
@@ -3144,56 +3205,60 @@ def setup_http_server():
             product_name = body.get("productName") or body.get("product_name") or ""
             username = body.get("username") or ""
             first_name = body.get("first_name") or ""
+            rating_only = bool(body.get("rating_only"))
+            referral_only = bool(body.get("referral_only"))
             if not user_id:
                 return _json_response({"error": "user_id required"}, status=400)
             if amount_rub <= 0:
                 return _json_response({"error": "amount_rub must be > 0"}, status=400)
             
-            import db as _db
-            if _db.is_enabled():
-                await _db.user_upsert(user_id, username, first_name)
-                await _db.purchase_add(user_id, amount_rub, stars_amount, purchase_type, product_name)
-            else:
-                path = _get_users_data_path()
-                users_data = _read_json_file(path) or {}
-                if user_id not in users_data:
-                    users_data[user_id] = {
-                        "id": int(user_id) if user_id.isdigit() else user_id,
-                        "username": username,
-                        "first_name": first_name,
-                        "purchases": [],
-                    }
-                u = users_data[user_id]
-                if "purchases" not in u:
-                    u["purchases"] = []
-                u["purchases"].append({
-                    "stars_amount": stars_amount or int(amount_rub / 0.65),
-                    "amount": amount_rub,
-                    "type": purchase_type,
-                    "productName": product_name,
-                    "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                })
-                try:
-                    with open(path, "w", encoding="utf-8") as f:
-                        json.dump(users_data, f, ensure_ascii=False, indent=2)
-                except Exception as e:
-                    logger.warning("purchases_record write users_data: %s", e)
+            if not referral_only:
+                import db as _db
+                if _db.is_enabled():
+                    await _db.user_upsert(user_id, username, first_name)
+                    await _db.purchase_add(user_id, amount_rub, stars_amount, purchase_type, product_name)
+                else:
+                    path = _get_users_data_path()
+                    users_data = _read_json_file(path) or {}
+                    if user_id not in users_data:
+                        users_data[user_id] = {
+                            "id": int(user_id) if user_id.isdigit() else user_id,
+                            "username": username,
+                            "first_name": first_name,
+                            "purchases": [],
+                        }
+                    u = users_data[user_id]
+                    if "purchases" not in u:
+                        u["purchases"] = []
+                    u["purchases"].append({
+                        "stars_amount": stars_amount or int(amount_rub / 0.65),
+                        "amount": amount_rub,
+                        "type": purchase_type,
+                        "productName": product_name,
+                        "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    })
+                    try:
+                        with open(path, "w", encoding="utf-8") as f:
+                            json.dump(users_data, f, ensure_ascii=False, indent=2)
+                    except Exception as e:
+                        logger.warning("purchases_record write users_data: %s", e)
             
-            await _load_referrals()
-            user_ref = await _get_or_create_ref_user(user_id)
-            user_ref["username"] = user_ref.get("username") or username
-            user_ref["first_name"] = user_ref.get("first_name") or first_name
-            for pid, percent in (
-                (user_ref.get("parent1"), 0.15),
-                (user_ref.get("parent2"), 0.20),
-                (user_ref.get("parent3"), 0.25),
-            ):
-                if not pid:
-                    continue
-                pref = await _get_or_create_ref_user(pid)
-                pref["volume_rub"] = float(pref.get("volume_rub") or 0) + amount_rub
-                pref["earned_rub"] = float(pref.get("earned_rub") or 0) + amount_rub * percent
-            await _save_referrals()
+            if not rating_only:
+                await _load_referrals()
+                user_ref = await _get_or_create_ref_user(user_id)
+                user_ref["username"] = user_ref.get("username") or username
+                user_ref["first_name"] = user_ref.get("first_name") or first_name
+                for pid, percent in (
+                    (user_ref.get("parent1"), 0.15),
+                    (user_ref.get("parent2"), 0.20),
+                    (user_ref.get("parent3"), 0.25),
+                ):
+                    if not pid:
+                        continue
+                    pref = await _get_or_create_ref_user(pid)
+                    pref["volume_rub"] = float(pref.get("volume_rub") or 0) + amount_rub
+                    pref["earned_rub"] = float(pref.get("earned_rub") or 0) + amount_rub * percent
+                await _save_referrals()
             
             return _json_response({"success": True})
         except Exception as e:
