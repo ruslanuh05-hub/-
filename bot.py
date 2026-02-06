@@ -7,7 +7,7 @@ import base64
 import time
 import uuid
 from io import BytesIO
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, Union
 from aiohttp import web
 from aiohttp.web import Response
@@ -2946,6 +2946,136 @@ def setup_http_server():
     app.router.add_route("OPTIONS", "/api/cryptobot/create-invoice", lambda r: Response(status=204, headers=_cors_headers()))
     app.router.add_post("/api/cryptobot/check-invoice", cryptobot_check_invoice_handler)
     app.router.add_route("OPTIONS", "/api/cryptobot/check-invoice", lambda r: Response(status=204, headers=_cors_headers()))
+    
+    # Рейтинг покупателей
+    RATING_DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rating_data.json")
+    
+    def _read_rating_data():
+        return _read_json_file(RATING_DATA_FILE)
+    
+    def _write_rating_data(data: dict):
+        try:
+            with open(RATING_DATA_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.warning(f"rating_data write error: {e}")
+    
+    async def rating_leaderboard_handler(request):
+        """GET /api/rating/leaderboard?period=all|month|week|today — покупатели из users_data.json"""
+        try:
+            period = (request.query.get("period") or "all").lower()
+            if period not in ("all", "month", "week", "today"):
+                period = "all"
+            
+            entries = []
+            rating_prefs = _read_rating_data() or {}
+            
+            # Загружаем пользователей из базы (users_data.json)
+            _script_dir = os.path.dirname(os.path.abspath(__file__))
+            users_data = None
+            for p in [
+                os.path.join(_script_dir, "users_data.json"),
+                os.path.join(os.path.dirname(_script_dir), "users_data.json"),
+                os.path.join(_script_dir, "..", "users_data.json"),
+            ]:
+                if os.path.exists(p):
+                    users_data = _read_json_file(p)
+                    break
+            
+            if not users_data or not isinstance(users_data, dict):
+                return _json_response({"entries": []})
+            
+            now = datetime.now()
+            cutoff_all = 0
+            cutoff_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).timestamp()
+            cutoff_week = (now.timestamp() - 7 * 24 * 3600)
+            cutoff_today = now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+            
+            for uid, u in users_data.items():
+                if not isinstance(u, dict):
+                    continue
+                purchases = u.get("purchases") or []
+                if not purchases:
+                    continue
+                
+                total_stars = 0
+                orders_count = 0
+                for p in purchases:
+                    if not isinstance(p, dict):
+                        continue
+                    ts = None
+                    try:
+                        dt = p.get("date") or p.get("created_at") or p.get("timestamp")
+                        if dt:
+                            s = str(dt).replace("T", " ")[:19]
+                            ts = datetime.strptime(s, "%Y-%m-%d %H:%M:%S").timestamp()
+                        elif isinstance(dt, (int, float)):
+                            ts = float(dt) if dt > 1e9 else dt
+                    except Exception:
+                        pass
+                    if period == "month" and (not ts or ts < cutoff_month):
+                        continue
+                    if period == "week" and (not ts or ts < cutoff_week):
+                        continue
+                    if period == "today" and (not ts or ts < cutoff_today):
+                        continue
+                    stars = p.get("stars_amount") or p.get("starsAmount") or p.get("amount") or 0
+                    if isinstance(stars, (int, float)):
+                        total_stars += int(stars)
+                    orders_count += 1
+                
+                if orders_count <= 0:
+                    continue
+                if total_stars <= 0:
+                    total_stars = orders_count * 100
+                
+                show = rating_prefs.get(str(uid), {}).get("show_in_rating", True)
+                entries.append({
+                    "userId": str(uid),
+                    "username": u.get("username") or "",
+                    "firstName": u.get("first_name") or u.get("firstName") or "",
+                    "ordersCount": orders_count,
+                    "score": total_stars,
+                    "hidden": not show,
+                })
+            
+            entries.sort(key=lambda x: x["score"], reverse=True)
+            entries = entries[:50]
+            
+            for e in entries:
+                if e["hidden"]:
+                    e["username"] = ""
+                    e["firstName"] = ""
+            
+            return _json_response({"entries": entries})
+        except Exception as e:
+            logger.error(f"rating leaderboard error: {e}")
+            return _json_response({"entries": []})
+    
+    async def rating_anonymity_handler(request):
+        """POST /api/rating/anonymity { show: bool, userId: str }"""
+        try:
+            body = await request.json() if request.can_read_body else {}
+            show = body.get("show", True)
+            uid = str(body.get("userId") or "").strip()
+            if not uid:
+                return _json_response({"error": "userId required"}, status=400)
+            data = _read_rating_data() or {}
+            if uid not in data:
+                data[uid] = {}
+            data[uid]["show_in_rating"] = bool(show)
+            _write_rating_data(data)
+            return _json_response({"success": True, "show": show})
+        except Exception as e:
+            logger.error(f"rating anonymity error: {e}")
+            return _json_response({"error": str(e)}, status=500)
+    
+    def _rating_cors(r):
+        return Response(status=204, headers=_cors_headers())
+    app.router.add_get("/api/rating/leaderboard", rating_leaderboard_handler)
+    app.router.add_route("OPTIONS", "/api/rating/leaderboard", _rating_cors)
+    app.router.add_post("/api/rating/anonymity", rating_anonymity_handler)
+    app.router.add_route("OPTIONS", "/api/rating/anonymity", _rating_cors)
     
     # Раздача статических файлов мини-аппа (index.html, script.js, style.css, assets/* и т.д.)
     # Открывать: http://localhost:3000/
