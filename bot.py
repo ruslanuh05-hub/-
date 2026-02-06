@@ -2600,15 +2600,48 @@ def setup_http_server():
             raise RuntimeError("Fragment getBuyStarsLink: нет amount в messages[0]")
         return (str(address).strip(), int(amount), str(payload_b64))
 
-    async def _ton_wallet_send_safe(address: str, amount_nanoton: int, body_payload: str) -> Optional[str]:
+    async def _ton_wallet_send_safe(address: str, amount_nanoton: int, body_payload: str) -> tuple[Optional[str], Optional[str]]:
+        """Возвращает (tx_hash, None) при успехе или (None, error_message) при ошибке."""
         if not TONAPI_KEY or not MNEMONIC:
-            return None
+            return (None, "TONAPI_KEY или MNEMONIC не заданы")
         try:
             from tonutils.client import TonapiClient
             from tonutils.utils import to_amount
             from tonutils.wallet import WalletV5R1
             client = TonapiClient(api_key=TONAPI_KEY, is_testnet=False)
             wallet, _, _, _ = WalletV5R1.from_mnemonic(client, MNEMONIC)
+            wallet_addr = getattr(wallet, "address", None)
+            if wallet_addr is not None:
+                addr_str = getattr(wallet_addr, "to_str", lambda: str(wallet_addr))()
+                if addr_str:
+                    fee_buffer = 50_000_000  # 0.05 TON на комиссию
+                    try:
+                        async with aiohttp.ClientSession() as sess:
+                            async with sess.get(
+                                f"https://tonapi.io/v2/accounts/{addr_str}",
+                                headers={"Authorization": f"Bearer {TONAPI_KEY}"}
+                            ) as resp:
+                                if resp.status == 200:
+                                    data = await resp.json(content_type=None) if resp.content_type else {}
+                                    bal_raw = data.get("balance")
+                                    bal = 0
+                                    if isinstance(bal_raw, (int, float)):
+                                        bal = int(bal_raw)
+                                    elif isinstance(bal_raw, str):
+                                        bal = int(float(bal_raw)) if bal_raw else 0
+                                    elif isinstance(bal_raw, dict):
+                                        ton_val = bal_raw.get("ton") or bal_raw.get("ton_string") or 0
+                                        nano_val = bal_raw.get("nanoton") or bal_raw.get("nano") or 0
+                                        if isinstance(ton_val, str):
+                                            ton_val = float(ton_val.replace(",", ".") or 0)
+                                        bal = int(float(ton_val or 0) * 1e9) + int(nano_val or 0)
+                                    need = amount_nanoton + fee_buffer
+                                    if bal > 0 and bal < need:
+                                        return (None, f"Недостаточно TON на кошельке бота: нужно {amount_nanoton/1e9:.4f} TON + ~0.05 комиссия, доступно {bal/1e9:.4f} TON")
+                                    elif bal == 0:
+                                        logger.info("TON balance check: 0 or unknown format (bal_raw=%s), пробуем отправить", type(bal_raw).__name__)
+                    except Exception as be:
+                        logger.warning("Balance check failed: %s", be)
             amount_val = to_amount(amount_nanoton, 9, 9)
             if asyncio.iscoroutinefunction(wallet.transfer):
                 tx_hash = await wallet.transfer(destination=address, amount=amount_val, body=body_payload)
@@ -2617,10 +2650,13 @@ def setup_http_server():
                     None,
                     lambda: wallet.transfer(destination=address, amount=amount_val, body=body_payload)
                 )
-            return str(tx_hash) if tx_hash else None
+            return (str(tx_hash) if tx_hash else None, None)
         except Exception as e:
+            err = str(e).strip() or repr(e)
             logger.exception("TON wallet send error: %s", e)
-            return None
+            if "insufficient" in err.lower() or "balance" in err.lower() or "not enough" in err.lower():
+                return (None, f"Недостаточно TON: {err}")
+            return (None, err)
 
     async def _fragment_site_create_star_order(app_: web.Application, *, recipient: str, stars_amount: int) -> dict:
         """Создание заказа: только валидация + при наличии кошелька не отдаём ссылку (оплата через CryptoBot, затем deliver-stars)."""
@@ -2809,9 +2845,10 @@ def setup_http_server():
             req_id = await _fragment_init_buy(recipient_address, stars_amount)
             tx_address, amount_nanoton, payload_b64 = await _fragment_get_buy_link(req_id)
             payload_decoded = _fragment_encoded(payload_b64)
-            tx_hash = await _ton_wallet_send_safe(tx_address, amount_nanoton, payload_decoded)
+            tx_hash, send_err = await _ton_wallet_send_safe(tx_address, amount_nanoton, payload_decoded)
             if not tx_hash:
-                return _json_response({"error": "wallet_error", "message": "Не удалось отправить TON (проверьте баланс и логи)"}, status=502)
+                msg = send_err or "Не удалось отправить TON"
+                return _json_response({"error": "wallet_error", "message": msg}, status=502)
             logger.info("Fragment stars delivered: recipient=%s, amount=%s, tx=%s", recipient, stars_amount, tx_hash)
             return _json_response({"success": True, "recipient": recipient, "stars_amount": stars_amount, "tx_hash": tx_hash})
         except RuntimeError as e:
@@ -3159,7 +3196,7 @@ def setup_http_server():
                 })
             
             entries.sort(key=lambda x: x["score"], reverse=True)
-            entries = entries[:50]
+            entries = entries[:15]
             
             for e in entries:
                 if e["hidden"]:
