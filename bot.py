@@ -2012,6 +2012,7 @@ def setup_http_server():
             level = 3
             progress_percent = 100
             to_next_volume_rub = 0.0
+            remaining_ton = 0.0
         else:
             if volume_ton >= L2_TON:
                 level = 2
@@ -2027,6 +2028,7 @@ def setup_http_server():
             remaining_ton = max(0.0, target - volume_ton)
             to_next_volume_rub = remaining_ton * ton_rate
 
+        to_next_volume_ton = round(remaining_ton, 6) if volume_ton < L3_TON else 0.0
         payload = {
             "user_id": uid,
             "earned_rub": round(earned_rub, 2),
@@ -2041,6 +2043,7 @@ def setup_http_server():
             "max_level": max_level,
             "progress_percent": progress_percent,
             "to_next_volume_rub": round(to_next_volume_rub, 2),
+            "to_next_volume_ton": to_next_volume_ton,
             "ton_rate_rub": ton_rate,
         }
         return _json_response(payload)
