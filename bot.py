@@ -2742,7 +2742,9 @@ def setup_http_server():
                     "stars_amount": stars_amount,
                     "recipient": recipient,
                     "mode": "wallet",
-                    "message": "Оплатите через CryptoBot; после оплаты нажмите «Подтвердить оплату» — звёзды будут отправлены автоматически.",
+                    # Более нейтральное сообщение для фронта: оплата уже открыта,
+                    # дальше пользователь просто подтверждает.
+                    "message": "Мы открыли способ оплаты. После оплаты вернитесь в мини‑приложение и нажмите «Подтвердить оплату» — звёзды будут отправлены автоматически.",
                 })
             res = await _fragment_site_create_star_order(request.app, recipient=recipient, stars_amount=stars_amount)
             return _json_response({
