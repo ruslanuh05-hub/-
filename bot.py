@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 # ============ НАСТРОЙКИ ============
 # Домен: Jetstoreapp.ru
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8528977779:AAHbPeWIA8rNuDyHc_eI7F7c2qr3M8Xw3_o")
-ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "6928639672").split(",") if x.strip()]
+ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "6928639672,5235957477").split(",") if x.strip()]
 WEB_APP_URL = os.getenv("WEB_APP_URL", "https://jetstoreapp.ru")
 ADM_WEB_APP_URL = os.getenv("ADM_WEB_APP_URL", "https://jetstoreapp.ru/html/admin.html")
 
@@ -64,17 +64,44 @@ PENDING_SELL_STARS_ORDERS: dict[str, dict] = {}
 REFERRALS: dict[str, dict] = {}
 REFERRALS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "referrals_data.json")
 
-# Ключ для шифрования ID в реферальной ссылке (без ключа — fallback к открытому ID)
+# Ключ для шифрования ID в реферальной ссылке (XOR + base62 = короткая ссылка)
 REFERRAL_ENC_KEY = (os.getenv("REFERRAL_ENC_KEY", "jet_ref_2024_secret") or "").encode()[:32].ljust(32, b"0")
+_B62_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+
+def _ref_secret_int() -> int:
+    """Секретное число для XOR (из ключа)."""
+    h = sum((b << (i % 56)) for i, b in enumerate(REFERRAL_ENC_KEY or b"0")) & 0xFFFFFFFFFFFFFFFF
+    return h or 0x5A5A5A5A5A5A5A5A
+
+
+def _b62_encode(n: int) -> str:
+    if n <= 0:
+        return "0"
+    s = []
+    base = 62
+    while n:
+        s.append(_B62_ALPHABET[n % base])
+        n //= base
+    return "".join(reversed(s))
+
+
+def _b62_decode(s: str) -> int:
+    n = 0
+    for c in s:
+        idx = _B62_ALPHABET.find(c)
+        if idx < 0:
+            raise ValueError("invalid base62")
+        n = n * 62 + idx
+    return n
 
 
 def _encrypt_ref_id(user_id: int) -> str:
-    """Шифрует user_id для реферальной ссылки (XOR + base64)."""
+    """Шифрует user_id для реферальной ссылки (XOR + base62 = короче)."""
     try:
-        s = str(user_id).encode()
-        key = REFERRAL_ENC_KEY or b"jet_ref_default_key_32bytes!!"
-        enc = bytes(s[i] ^ key[i % len(key)] for i in range(len(s)))
-        return base64.urlsafe_b64encode(enc).decode().rstrip("=")
+        secret = _ref_secret_int()
+        x = (user_id ^ secret) & 0xFFFFFFFFFFFFFFFF
+        return _b62_encode(x)
     except Exception:
         return str(user_id)
 
@@ -84,13 +111,9 @@ def _decrypt_ref_id(enc: str) -> Optional[int]:
     if not enc:
         return None
     try:
-        raw = enc
-        if len(raw) % 4:
-            raw += "=" * (4 - len(raw) % 4)
-        data = base64.urlsafe_b64decode(raw)
-        key = REFERRAL_ENC_KEY or b"jet_ref_default_key_32bytes!!"
-        dec = bytes(data[i] ^ key[i % len(key)] for i in range(len(data)))
-        return int(dec.decode())
+        x = _b62_decode(enc)
+        secret = _ref_secret_int()
+        return (x ^ secret) & 0xFFFFFFFFFFFFFFFF
     except Exception:
         try:
             return int(enc)
