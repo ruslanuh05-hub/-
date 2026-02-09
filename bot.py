@@ -2731,9 +2731,10 @@ def setup_http_server():
         invoice_id = body.get("invoice_id")
         
         # Для CryptoBot принимаем ТОЛЬКО invoice_id - остальное игнорируем
+        # Если invoice_id нет — возвращаем paid: false (без 400), чтобы клиент не показывал ошибку
         if method == "cryptobot":
             if not invoice_id:
-                return _json_response({"error": "bad_request", "message": "invoice_id обязателен для CryptoBot"}, status=400)
+                return _json_response({"paid": False})
             # Продолжаем проверку только с invoice_id
         else:
             # Для других методов (Fragment, TON) используем старую логику
