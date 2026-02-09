@@ -39,7 +39,14 @@ logger = logging.getLogger(__name__)
 
 # ============ НАСТРОЙКИ ============
 # Домен: Jetstoreapp.ru
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8528977779:AAHbPeWIA8rNuDyHc_eI7F7c2qr3M8Xw3_o")
+# ВАЖНО: токен бота ДОЛЖЕН задаваться только через переменную окружения BOT_TOKEN.
+# Никаких дефолтных значений в коде быть не должно, чтобы не утек секретный токен.
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+if not BOT_TOKEN:
+    raise RuntimeError(
+        "BOT_TOKEN не задан. Установите переменную окружения BOT_TOKEN "
+        "(например, в Railway/Render) перед запуском бота."
+    )
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "6928639672,5235957477").split(",") if x.strip()]
 WEB_APP_URL = os.getenv("WEB_APP_URL", "https://jetstoreapp.ru")
 ADM_WEB_APP_URL = os.getenv("ADM_WEB_APP_URL", "https://jetstoreapp.ru/html/admin.html")
@@ -50,6 +57,14 @@ TON_NOTIFY_CHAT_ID = int(os.getenv("TON_NOTIFY_CHAT_ID", "0") or "0")
 
 # Курс выплаты за 1 звезду (RUB), используем тот же, что в мини-аппе
 STAR_BUY_RATE_RUB = float(os.getenv("STAR_BUY_RATE_RUB", "0.65") or "0.65")
+# Цена покупки 1 звезды (RUB) — для конвертации звёзд в рубли при оплате через CryptoBot
+STAR_PRICE_RUB = float(os.getenv("STAR_PRICE_RUB", "1.37") or "1.37")
+# Цены на Premium в рублях (по умолчанию совпадают с мини‑аппом)
+PREMIUM_PRICES_RUB = {
+    3: float(os.getenv("PREMIUM_PRICE_3M", "983") or "983"),
+    6: float(os.getenv("PREMIUM_PRICE_6M", "1311") or "1311"),
+    12: float(os.getenv("PREMIUM_PRICE_12M", "2377") or "2377"),
+}
 
 # Заказы на продажу звёзд из мини-приложения: order_id -> { user_id, username, first_name, last_name, stars_amount, method, payout_* }
 # После successful_payment по payload "sell_stars:order_id" отправляем уведомление и удаляем запись
@@ -1752,6 +1767,8 @@ def setup_http_server():
     app["ton_orders"] = {}
     # event_id уже использованных входящих TON-переводов (при проверке по сумме без комментария)
     app["ton_verified_event_ids"] = set()
+    # CryptoBot: invoice_id -> meta (context, user_id, purchase, amount_rub, created_at, delivered)
+    app["cryptobot_orders"] = {}
     # Preflight для CORS
     app.router.add_route('OPTIONS', '/api/telegram/user', lambda r: Response(status=204, headers={
         'Access-Control-Allow-Origin': '*',
@@ -2753,6 +2770,15 @@ def setup_http_server():
             return _json_response({"paid": False, "order_id": order_id})
         if invoice_id and method == "cryptobot" and CRYPTO_PAY_TOKEN:
             try:
+                # Метаданные инвойса, сохранённые при создании
+                order_meta = None
+                try:
+                    orders = request.app.get("cryptobot_orders")
+                    if isinstance(orders, dict):
+                        order_meta = orders.get(str(invoice_id))
+                except Exception as meta_err:
+                    logger.warning("cryptobot order meta read failed for %s: %s", invoice_id, meta_err)
+
                 async with aiohttp.ClientSession() as session:
                     async with session.get(
                         f"{CRYPTO_PAY_BASE}/getInvoices",
@@ -2775,22 +2801,29 @@ def setup_http_server():
                                         paid_invoice = inv
                                         break
                                 if paid_invoice:
-                                    # Сумма в рублях для реферальной системы:
-                                    # берём из тела запроса (baseAmount/totalAmount), т.к. инвойс создавали в RUB
+                                    # Сумма в рублях для реферальной системы и логики выдачи
                                     amount_rub = None
-                                    base_req = body.get("baseAmount") or body.get("base_amount")
-                                    total_req = body.get("totalAmount") or body.get("total_amount")
-                                    try:
-                                        if base_req is not None:
-                                            amount_rub = round(float(base_req), 2)
-                                        elif total_req is not None:
-                                            amount_rub = round(float(total_req), 2)
-                                    except (TypeError, ValueError):
-                                        amount_rub = None
+                                    if order_meta and isinstance(order_meta.get("amount_rub"), (int, float)):
+                                        amount_rub = round(float(order_meta["amount_rub"]), 2)
 
                                     response_data = {"paid": True, "invoice_id": invoice_id}
                                     if amount_rub and amount_rub > 0:
                                         response_data["amount_rub"] = amount_rub
+
+                                    # Если это покупка звёзд через CryptoBot, можем пометить, что выдача выполнена
+                                    if order_meta and order_meta.get("context") == "purchase":
+                                        purchase_meta = order_meta.get("purchase") or {}
+                                        if purchase_meta.get("type") == "stars":
+                                            # Здесь пока не запускаем Fragment-выдачу напрямую, так как
+                                            # сейчас используется сайт fragment.com и/или TonKeeper/webhook.
+                                            # Главное — не доверять данным от клиента.
+                                            try:
+                                                orders = request.app.get("cryptobot_orders")
+                                                if isinstance(orders, dict):
+                                                    orders[str(invoice_id)]["delivered"] = True
+                                            except Exception as upd_err:
+                                                logger.warning("Failed to mark cryptobot order delivered: %s", upd_err)
+
                                     return _json_response(response_data)
             except Exception as e:
                 logger.warning(f"Crypto Pay check invoice {invoice_id}: {e}")
@@ -2821,7 +2854,18 @@ def setup_http_server():
     app.router.add_route("OPTIONS", "/api/fragment/status", lambda r: Response(status=204, headers=_cors_headers()))
 
     async def fragment_deliver_stars_handler(request):
-        """Выдача звёзд как в ezstar: бот отправляет TON с своего кошелька в Fragment (get address → init → get link → send TON)."""
+        """
+        Выдача звёзд как в ezstar: бот отправляет TON с своего кошелька в Fragment
+        (get address → init → get link → send TON).
+
+        ВНИМАНИЕ: этот хендлер больше не должен вызываться напрямую с клиентской стороны.
+        Публичный HTTP‑эндпоинт /api/fragment/deliver-stars отключён, чтобы злоумышленник
+        не мог бесплатно выдавать себе звёзды, просто сделав POST‑запрос.
+
+        Логику выдачи звёзд следует вызывать только из доверенного бекенда
+        (например, из webhook‑обработчика платёжной системы или админ‑скрипта),
+        передавая сюда уже проверенные данные.
+        """
         if not TON_WALLET_ENABLED:
             return _json_response({
                 "error": "not_configured",
@@ -2857,9 +2901,6 @@ def setup_http_server():
         except Exception as e:
             logger.exception("Fragment deliver-stars error: %s", e)
             return _json_response({"error": "internal_error", "message": str(e)}, status=500)
-
-    app.router.add_post("/api/fragment/deliver-stars", fragment_deliver_stars_handler)
-    app.router.add_route("OPTIONS", "/api/fragment/deliver-stars", lambda r: Response(status=204, headers=_cors_headers()))
 
     # Создание заказа Fragment: при наличии TON-кошелька — только валидация (оплата CryptoBot → deliver-stars). Иначе — ссылка на оплату TON.
     async def fragment_create_star_order_handler(request):
@@ -2957,39 +2998,121 @@ def setup_http_server():
 
     # CryptoBot create invoice
     async def cryptobot_create_invoice_handler(request):
+        """
+        Создание инвойса CryptoBot.
+
+        ВАЖНО: пользователь НЕ задаёт цену и payload напрямую.
+        Фронт может передавать:
+        - context='purchase' + purchase (type, stars_amount, months, login) + user_id
+        - context='deposit'  + amount (RUB) + user_id
+        """
         if not CRYPTO_PAY_TOKEN:
-            return _json_response({"error": "not_configured", "message": "CRYPTO_PAY_TOKEN не задан. Добавьте в переменные окружения Railway/Render."}, status=503)
+            return _json_response(
+                {
+                    "error": "not_configured",
+                    "message": "CRYPTO_PAY_TOKEN не задан. Добавьте в переменные окружения Railway/Render.",
+                },
+                status=503,
+            )
+
         try:
             body = await request.json()
         except Exception:
             return _json_response({"error": "bad_request", "message": "Invalid JSON"}, status=400)
-        amount_usdt = body.get("amount_usdt")
-        amount_rub = body.get("amount") or body.get("total_amount")
-        use_usdt = amount_usdt is not None and str(amount_usdt).strip() != ""
-        try:
-            if use_usdt:
-                amount = float(amount_usdt)
-            else:
-                amount = float(amount_rub) if amount_rub is not None else 0
-        except (TypeError, ValueError):
-            return _json_response({"error": "bad_request", "message": "amount or amount_usdt is required (number)"}, status=400)
-        if use_usdt:
-            if amount < 0.1:
-                return _json_response({"error": "bad_request", "message": "Minimum USDT 0.1"}, status=400)
-            if amount > 100_000:
-                return _json_response({"error": "bad_request", "message": "Maximum USDT 100,000"}, status=400)
-        else:
-            if amount < 1:
-                return _json_response({"error": "bad_request", "message": "Minimum amount 1 RUB"}, status=400)
-            if amount > 1_000_000:
-                return _json_response({"error": "bad_request", "message": "Maximum amount 1,000,000 RUB"}, status=400)
-        description = (body.get("description") or (f"Оплата {amount:.2f} USDT" if use_usdt else f"Оплата {amount:.0f} ₽")).strip()[:1024]
-        payload_data = body.get("payload") or ""
-        if isinstance(payload_data, dict):
-            payload_data = json.dumps(payload_data, ensure_ascii=False)[:4096]
-        else:
-            payload_data = str(payload_data)[:4096]
 
+        context = (body.get("context") or "").strip() or "deposit"
+        user_id = str(body.get("user_id") or body.get("userId") or "").strip() or "unknown"
+
+        amount: float
+        description: str
+        payload_data: str
+        use_usdt = False  # пока создаём инвойсы только в RUB, USDT-логику можно добавить отдельно
+
+        # ----------- Покупка (звёзды / премиум) -----------
+        if context == "purchase":
+            purchase = body.get("purchase") or {}
+            ptype = (purchase.get("type") or "").strip()
+
+            if ptype == "stars":
+                try:
+                    stars_amount = int(purchase.get("stars_amount") or purchase.get("starsAmount") or 0)
+                except (TypeError, ValueError):
+                    stars_amount = 0
+                login = (purchase.get("login") or "").strip().lstrip("@")
+                if stars_amount <= 0 or not login:
+                    return _json_response(
+                        {"error": "bad_request", "message": "Неверные данные покупки звёзд"}, status=400
+                    )
+                amount = round(stars_amount * STAR_PRICE_RUB, 2)
+                if amount < 1:
+                    amount = 1.0
+                description = f"Звёзды Telegram — {stars_amount} шт. для @{login}"
+                payload_data = json.dumps(
+                    {
+                        "context": "purchase",
+                        "type": "stars",
+                        "user_id": user_id,
+                        "login": login,
+                        "stars_amount": stars_amount,
+                        "amount_rub": amount,
+                        "timestamp": time.time(),
+                    },
+                    ensure_ascii=False,
+                )[:4096]
+            elif ptype == "premium":
+                try:
+                    months = int(purchase.get("months") or 0)
+                except (TypeError, ValueError):
+                    months = 0
+                if months not in PREMIUM_PRICES_RUB:
+                    return _json_response(
+                        {"error": "bad_request", "message": "Неверная длительность Premium"}, status=400
+                    )
+                amount = float(PREMIUM_PRICES_RUB[months])
+                description = f"Telegram Premium — {months} мес."
+                payload_data = json.dumps(
+                    {
+                        "context": "purchase",
+                        "type": "premium",
+                        "user_id": user_id,
+                        "months": months,
+                        "amount_rub": amount,
+                        "timestamp": time.time(),
+                    },
+                    ensure_ascii=False,
+                )[:4096]
+            else:
+                return _json_response(
+                    {"error": "bad_request", "message": "Поддерживаются только покупки звёзд и Premium"}, status=400
+                )
+
+        # ----------- Пополнение баланса (депозит) -----------
+        else:
+            amount_rub = body.get("amount") or body.get("total_amount")
+            try:
+                amount = float(amount_rub) if amount_rub is not None else 0.0
+            except (TypeError, ValueError):
+                return _json_response(
+                    {"error": "bad_request", "message": "amount должен быть числом (RUB)"}, status=400
+                )
+            if amount < 1:
+                return _json_response({"error": "bad_request", "message": "Минимальная сумма 1 ₽"}, status=400)
+            if amount > 1_000_000:
+                return _json_response(
+                    {"error": "bad_request", "message": "Максимальная сумма 1,000,000 ₽"}, status=400
+                )
+            description = f"Пополнение баланса JET Store на {amount:.0f} ₽"
+            payload_data = json.dumps(
+                {
+                    "context": "deposit",
+                    "user_id": user_id,
+                    "amount_rub": amount,
+                    "timestamp": time.time(),
+                },
+                ensure_ascii=False,
+            )[:4096]
+
+        # ----------- Общие поля инвойса -----------
         paid_btn_url = WEB_APP_URL or "https://jetstoreapp.ru"
         try:
             me = await bot.get_me()
@@ -2998,32 +3121,21 @@ def setup_http_server():
         except Exception:
             pass
 
-        if use_usdt:
-            payload_obj = {
-                "currency_type": "crypto",
-                "asset": "USDT",
-                "amount": f"{amount:.2f}",
-                "description": description,
-                "payload": payload_data,
-                "paid_btn_name": "callback",
-                "paid_btn_url": paid_btn_url,
-            }
-        else:
-            payload_obj = {
-                "currency_type": "fiat",
-                "fiat": "RUB",
-                "amount": f"{amount:.2f}",
-                "description": description,
-                "accepted_assets": "USDT,TON,BTC,ETH,TRX,USDC",
-                "payload": payload_data,
-                "paid_btn_name": "callback",
-                "paid_btn_url": paid_btn_url,
-            }
+        payload_obj = {
+            "currency_type": "fiat",
+            "fiat": "RUB",
+            "amount": f"{amount:.2f}",
+            "description": description[:1024],
+            "accepted_assets": "USDT,TON,BTC,ETH,TRX,USDC",
+            "payload": payload_data,
+            "paid_btn_name": "callback",
+            "paid_btn_url": paid_btn_url,
+        }
         headers = {
             "Content-Type": "application/json",
             "Crypto-Pay-API-Token": CRYPTO_PAY_TOKEN,
         }
-        logger.info(f"CryptoBot createInvoice: amount={amount}, mode={'USDT' if use_usdt else 'RUB'}")
+        logger.info(f"CryptoBot createInvoice: context={context}, amount={amount}")
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(f"{CRYPTO_PAY_BASE}/createInvoice", headers=headers, json=payload_obj) as resp:
@@ -3056,9 +3168,31 @@ def setup_http_server():
                             if inv.get(k):
                                 pay_url = inv[k]
                                 break
-                    logger.info(f"CryptoBot invoice created: invoice_id={inv.get('invoice_id')}, pay_url_len={len(pay_url) if pay_url else 0}")
+                    invoice_id = inv.get("invoice_id")
+                    logger.info(
+                        "CryptoBot invoice created: invoice_id=%s, context=%s, amount=%s, pay_url_len=%s",
+                        invoice_id,
+                        context,
+                        amount,
+                        len(pay_url) if pay_url else 0,
+                    )
+                    # Сохраняем метаданные инвойса на стороне сервера,
+                    # чтобы не доверять данным из клиента при последующей проверке оплаты.
+                    try:
+                        orders = request.app.get("cryptobot_orders")
+                        if isinstance(orders, dict) and invoice_id:
+                            orders[str(invoice_id)] = {
+                                "context": context,
+                                "user_id": user_id,
+                                "amount_rub": float(amount),
+                                "purchase": purchase if context == "purchase" else None,
+                                "created_at": time.time(),
+                                "delivered": False,
+                            }
+                    except Exception as meta_err:
+                        logger.warning("Failed to store cryptobot order meta: %s", meta_err)
                     return _json_response({
-                        "success": True, "invoice_id": inv.get("invoice_id"),
+                        "success": True, "invoice_id": invoice_id,
                         "payment_url": pay_url or None, "pay_url": pay_url or None, "hash": inv.get("hash"),
                     })
         except aiohttp.ClientError as e:
@@ -3329,10 +3463,15 @@ def setup_http_server():
     app.router.add_route("OPTIONS", "/api/purchases/record", lambda r: Response(status=204, headers=_cors_headers()))
     
     # Раздача статических файлов мини-аппа (index.html, script.js, style.css, assets/* и т.д.)
-    # Открывать: http://localhost:3000/
-    # ВАЖНО: добавляем ПОСЛЕ /api/*, чтобы статика не перехватывала API-роуты
-    static_dir = os.path.dirname(os.path.abspath(__file__))
-    app.router.add_static('/', static_dir, show_index=True)
+    # В продакшене статику лучше обслуживать отдельным хостингом (например, GitHub Pages / Nginx),
+    # чтобы API-сервер НЕ раздавал исходники (bot.py, конфиги и т.п.).
+    #
+    # Для локальной разработки можно включить раздачу статики, установив SERVE_STATIC=1.
+    if os.getenv("SERVE_STATIC", "").strip() == "1":
+        # Отдаём только каталог html/, а не весь репозиторий
+        static_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "html")
+        if os.path.isdir(static_root):
+            app.router.add_static("/", static_root, show_index=False)
     return app
 
 # ============ ЗАПУСК БОТА ============
