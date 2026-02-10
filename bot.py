@@ -3084,7 +3084,7 @@ def setup_http_server():
         payload_data: str
         use_usdt = False  # пока создаём инвойсы только в RUB, USDT-логику можно добавить отдельно
 
-        # ----------- Покупка (звёзды / премиум) -----------
+        # ----------- Покупка (звёзды / премиум / Steam) -----------
         if context == "purchase":
             purchase = body.get("purchase") or {}
             ptype = (purchase.get("type") or "").strip()
@@ -3145,9 +3145,42 @@ def setup_http_server():
                     },
                     ensure_ascii=False,
                 )[:4096]
+            elif ptype == "steam":
+                # Покупка пополнения Steam: сумму указываем в рублях,
+                # логин Steam хранится в payload, чтобы вебхук мог отправить задачу FunPay‑боту.
+                try:
+                    amount_rub = float(purchase.get("amount") or 0)
+                except (TypeError, ValueError):
+                    amount_rub = 0.0
+                login = (purchase.get("login") or "").strip()
+                if amount_rub <= 0:
+                    return _json_response(
+                        {"error": "bad_request", "message": "Неверная сумма пополнения Steam"}, status=400
+                    )
+                if amount_rub > 1_000_000:
+                    return _json_response(
+                        {"error": "bad_request", "message": "Максимальная сумма 1,000,000 ₽"}, status=400
+                    )
+                if not login:
+                    return _json_response(
+                        {"error": "bad_request", "message": "Укажите логин Steam"}, status=400
+                    )
+                amount = float(amount_rub)
+                description = f"Пополнение Steam для {login} на {amount_rub:.2f} ₽"
+                payload_data = json.dumps(
+                    {
+                        "context": "purchase",
+                        "type": "steam",
+                        "user_id": user_id,
+                        "login": login,
+                        "amount_rub": amount_rub,
+                        "timestamp": time.time(),
+                    },
+                    ensure_ascii=False,
+                )[:4096]
             else:
                 return _json_response(
-                    {"error": "bad_request", "message": "Поддерживаются только покупки звёзд и Premium"}, status=400
+                    {"error": "bad_request", "message": "Поддерживаются только покупки звёзд, Premium и Steam"}, status=400
                 )
 
         # ----------- Пополнение баланса (депозит) -----------
