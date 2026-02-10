@@ -2480,9 +2480,14 @@ def setup_http_server():
     app.router.add_get("/api/donatehub/order/{id}", donatehub_order_status_handler)
     
     # Crypto Pay (CryptoBot)
+    # Для тестов через @CryptoTestnetBot можно:
+    #   - выдать тестовый токен;
+    #   - в Railway установить CRYPTO_PAY_TOKEN=ТЕСТОВЫЙ_ТОКЕН
+    #   - при необходимости переопределить базовый URL:
+    #       CRYPTO_PAY_BASE=https://testnet-pay.crypt.bot/api
     _cryptobot_cfg_early = _read_json_file(os.path.join(os.path.dirname(os.path.abspath(__file__)), "cryptobot_config.json"))
     CRYPTO_PAY_TOKEN = _get_env_clean("CRYPTO_PAY_TOKEN") or _cryptobot_cfg_early.get("api_token", "")
-    CRYPTO_PAY_BASE = "https://pay.crypt.bot/api"
+    CRYPTO_PAY_BASE = os.getenv("CRYPTO_PAY_BASE", "https://pay.crypt.bot/api").rstrip("/")
 
     # Fragment.com (сайт) — вызов fragment.com/api через cookies + hash (как в ezstar).
     _script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -3368,13 +3373,56 @@ def setup_http_server():
                         orders[str(invoice_id)]["delivered"] = True
                 
                 elif purchase_type == "steam":
-                    # Пополнение Steam через DonateHub (если будет реализовано)
+                    # Пополнение Steam: выдача через FunPay‑бота (отдельный сервис)
                     account = (purchase.get("login") or "").strip()
                     amount = float(purchase.get("amount") or amount_rub)
-                    logger.info(f"CryptoBot webhook: steam purchase detected, invoice_id={invoice_id}, account={account}, amount={amount}")
-                    # TODO: реализовать пополнение Steam через DonateHub API
-                    if isinstance(orders, dict):
-                        orders[str(invoice_id)]["delivered"] = True
+                    logger.info(
+                        "CryptoBot webhook: steam purchase detected, invoice_id=%s, account=%s, amount=%.2f",
+                        invoice_id,
+                        account,
+                        amount,
+                    )
+
+                    # Настройки FunPay/уведомлений:
+                    # - FUNPAY_STEAM_URL: ссылка на ваш лот/профиль FunPay для покупки пополнения Steam
+                    # - STEAM_NOTIFY_CHAT_ID: ID чата/канала, куда слать задания вашему FunPay‑боту
+                    funpay_url = os.getenv("FUNPAY_STEAM_URL", "").strip()
+                    steam_notify_chat_id = int(os.getenv("STEAM_NOTIFY_CHAT_ID", "0") or "0")
+
+                    # Формируем текст задачи: FunPay‑бот смотрит этот чат и сам создаёт/обрабатывает заказы.
+                    notify_lines = [
+                        "💻 Новый заказ пополнения Steam (FunPay)",
+                        "",
+                        f"👤 Аккаунт Steam: <code>{account or '—'}</code>",
+                        f"💰 Сумма к пополнению: <b>{amount_rub:.2f} ₽</b>",
+                        f"🧾 CryptoBot invoice_id: <code>{invoice_id}</code>",
+                    ]
+                    if funpay_url:
+                        notify_lines.append("")
+                        notify_lines.append(f"🛒 Лот / профиль FunPay: {funpay_url}")
+                        notify_lines.append("➡️ Оформите пополнение через FunPay‑бота для этого аккаунта Steam.")
+                    notify_text = "\n".join(notify_lines)
+
+                    if steam_notify_chat_id:
+                        try:
+                            await bot.send_message(
+                                chat_id=steam_notify_chat_id,
+                                text=notify_text,
+                                parse_mode="HTML",
+                                disable_web_page_preview=True,
+                            )
+                        except Exception as send_err:
+                            logger.warning(
+                                "Failed to send Steam FunPay notify to chat %s: %s",
+                                steam_notify_chat_id,
+                                send_err,
+                            )
+                    else:
+                        logger.warning(
+                            "STEAM_NOTIFY_CHAT_ID not set; Steam FunPay task will not be sent. "
+                            "Text:\n%s",
+                            notify_text,
+                        )
                 
                 # Записываем покупку в базу данных (рейтинг + рефералы)
                 try:
