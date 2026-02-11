@@ -543,6 +543,12 @@ class Database:
 • ⭐️ <b>Покупку звёзд</b>
 • 🎡 <b>Участие в рулетке</b>
 • 🗂️ <b>Каталог цифровых товаров</b>''',
+            'about_text_en': '''<b>🌟 About Jet Store Service</b>
+
+We provide:
+• ⭐️ <b>Star purchase</b>
+• 🎡 <b>Roulette participation</b>
+• 🗂️ <b>Digital goods catalog</b>''',
             'notifications': []
         }
         self.admins = set(ADMIN_IDS)  # Админы ТОЛЬКО из кода
@@ -770,9 +776,6 @@ def get_main_menu(language: str = 'ru'):
         ],
         [
             InlineKeyboardButton(text="❓ Помощь", callback_data="help_info"),
-        ],
-        [
-            InlineKeyboardButton(text="ℹ️ О нас", callback_data="about_info"),
         ]
     ]
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
@@ -1549,7 +1552,7 @@ async def show_help(callback_query: types.CallbackQuery):
     """Раздел 'Помощь и контакты'"""
     help_text = (
         "💡 <b>Помощь и контакты</b>\n\n"
-        "Если есть вопросы — пишите <a href=\"https://t.me/L3ZTADM\">@L3ZTADM</a>\n\n"
+        "Поддержка: <a href=\"https://t.me/JetStoreHelper\">@JetStoreHelper</a>\n\n"
         "📄 Договор оферты: "
         "<a href=\"https://telegra.ph/Dogovor-Oferty-02-11-4\">читать</a>\n"
         "🔒 Политика конфиденциальности: "
