@@ -256,47 +256,25 @@ async def _apply_referral_earnings_for_purchase(
 ) -> None:
     """
     Начисляет реферальные проценты за покупку пользователя по цепочке parent1/parent2/parent3.
-    Работает и для PostgreSQL (через db.py), и для JSON-фоллбэка (REFERRALS dict + referrals_data.json).
+    Всегда работает через общую систему REFERRALS + _save_referrals(),
+    которая сама решает, писать в PostgreSQL или JSON (fallback).
+    Так мы исключаем расхождения между разными путями начисления.
     """
     try:
         amount = float(amount_rub or 0)
     except Exception:
+        logger.warning("apply_referral_earnings: неправильная сумма amount_rub=%r", amount_rub)
         return
     if amount <= 0:
+        logger.info("apply_referral_earnings: amount <= 0, начисление пропущено (amount=%s)", amount)
         return
 
     uid = str(user_id).strip()
     if not uid:
+        logger.warning("apply_referral_earnings: пустой user_id, начисление пропущено")
         return
 
-    # 1) PostgreSQL путь (если включён)
-    try:
-        import db as _db
-        if _db.is_enabled():
-            uref = await _db.ref_get_or_create(uid)
-            # Обновим минимально профильные поля (не критично, но полезно)
-            try:
-                if (username or first_name) and isinstance(uref, dict):
-                    uref["username"] = uref.get("username") or (username or "")
-                    uref["first_name"] = uref.get("first_name") or (first_name or "")
-                    await _db.ref_save(uid, uref)
-            except Exception:
-                pass
-
-            for pid, percent in (
-                (uref.get("parent1"), 0.15),
-                (uref.get("parent2"), 0.20),
-                (uref.get("parent3"), 0.25),
-            ):
-                if not pid:
-                    continue
-                earned_delta = amount * percent
-                await _db.ref_add_earned(str(pid), amount, earned_delta)
-            return
-    except Exception as e:
-        logger.warning(f"Referral earnings (DB) failed, fallback to JSON: {e}")
-
-    # 2) JSON fallback
+    # Загружаем существующие данные (из БД или JSON) и обновляем по цепочке
     await _load_referrals()
     user_ref = await _get_or_create_ref_user(uid)
     if username and not user_ref.get("username"):
@@ -304,16 +282,23 @@ async def _apply_referral_earnings_for_purchase(
     if first_name and not user_ref.get("first_name"):
         user_ref["first_name"] = first_name
 
-    for pid, percent in (
+    parents = (
         (user_ref.get("parent1"), 0.15),
         (user_ref.get("parent2"), 0.20),
         (user_ref.get("parent3"), 0.25),
-    ):
+    )
+    any_parent = False
+    for pid, percent in parents:
         if not pid:
             continue
+        any_parent = True
         pref = await _get_or_create_ref_user(pid)
         pref["volume_rub"] = float(pref.get("volume_rub") or 0.0) + amount
         pref["earned_rub"] = float(pref.get("earned_rub") or 0.0) + amount * percent
+
+    if not any_parent:
+        logger.info("apply_referral_earnings: у пользователя %s нет parent1/2/3, начислять некому", uid)
+        return
 
     await _save_referrals()
 
