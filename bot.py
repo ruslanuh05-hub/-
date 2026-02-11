@@ -2888,6 +2888,15 @@ def setup_http_server():
                         order_meta = orders.get(str(invoice_id))
                 except Exception as meta_err:
                     logger.warning("cryptobot order meta read failed for %s: %s", invoice_id, meta_err)
+                
+                # После перезапуска метаданные могут быть только в файле
+                if not order_meta:
+                    try:
+                        order_meta = _load_cryptobot_order_from_file(str(invoice_id))
+                        if order_meta and isinstance(orders, dict):
+                            orders[str(invoice_id)] = order_meta
+                    except Exception as meta_file_err:
+                        logger.warning("cryptobot order meta file read failed for %s: %s", invoice_id, meta_file_err)
 
                 async with aiohttp.ClientSession() as session:
                     async with session.get(
@@ -2920,10 +2929,66 @@ def setup_http_server():
                                     if amount_rub and amount_rub > 0:
                                         response_data["amount_rub"] = amount_rub
 
-                                    # Если это покупка звёзд через CryptoBot, можем пометить, что выдача выполнена
-                                    if order_meta and order_meta.get("context") == "purchase":
+                                    # Покупка через CryptoBot: для Steam отправляем задачу в группу даже без webhook
+                                    if order_meta and order_meta.get("context") == "purchase" and not order_meta.get("delivered"):
                                         purchase_meta = order_meta.get("purchase") or {}
-                                        if purchase_meta.get("type") == "stars":
+                                        ptype = (purchase_meta.get("type") or "").strip().lower()
+
+                                        if ptype == "steam":
+                                            account = (purchase_meta.get("login") or "").strip()
+                                            amount_steam = purchase_meta.get("amount_steam")
+                                            if amount_steam is None:
+                                                amount_steam = purchase_meta.get("amount") or amount_rub
+                                            try:
+                                                amount_steam = float(amount_steam)
+                                            except (TypeError, ValueError):
+                                                amount_steam = float(amount_rub or 0)
+
+                                            funpay_url = os.getenv("FUNPAY_STEAM_URL", "").strip()
+                                            steam_notify_chat_id = int(os.getenv("STEAM_NOTIFY_CHAT_ID", "0") or "0")
+                                            notify_lines = [
+                                                "💻 Новый заказ пополнения Steam (FunPay)",
+                                                "",
+                                                f"👤 Аккаунт Steam: <code>{account or '—'}</code>",
+                                                f"💰 Сумма на кошелёк Steam: <b>{amount_steam:.0f} ₽</b>",
+                                                f"💵 Оплачено: <b>{float(amount_rub or 0):.2f} ₽</b>",
+                                                f"🧾 CryptoBot invoice_id: <code>{invoice_id}</code>",
+                                            ]
+                                            if funpay_url:
+                                                notify_lines.append("")
+                                                notify_lines.append(f"🛒 Лот / профиль FunPay: {funpay_url}")
+                                                notify_lines.append("➡️ Оформите пополнение через FunPay‑бота для этого аккаунта Steam.")
+                                            notify_text = "\n".join(notify_lines)
+
+                                            if steam_notify_chat_id:
+                                                try:
+                                                    await bot.send_message(
+                                                        chat_id=steam_notify_chat_id,
+                                                        text=notify_text,
+                                                        parse_mode="HTML",
+                                                        disable_web_page_preview=True,
+                                                    )
+                                                    order_meta["delivered"] = True
+                                                    try:
+                                                        orders = request.app.get("cryptobot_orders")
+                                                        if isinstance(orders, dict):
+                                                            orders[str(invoice_id)]["delivered"] = True
+                                                    except Exception:
+                                                        pass
+                                                    _save_cryptobot_order_to_file(str(invoice_id), order_meta)
+                                                except Exception as send_err:
+                                                    logger.warning(
+                                                        "Failed to send Steam FunPay notify (fallback via payment/check) to chat %s: %s",
+                                                        steam_notify_chat_id,
+                                                        send_err,
+                                                    )
+                                            else:
+                                                logger.warning(
+                                                    "STEAM_NOTIFY_CHAT_ID not set; Steam FunPay task will not be sent (fallback via payment/check). Text:\n%s",
+                                                    notify_text,
+                                                )
+
+                                        elif ptype == "stars":
                                             # Здесь пока не запускаем Fragment-выдачу напрямую, так как
                                             # сейчас используется сайт fragment.com и/или TonKeeper/webhook.
                                             # Главное — не доверять данным от клиента.
