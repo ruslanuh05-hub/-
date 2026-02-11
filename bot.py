@@ -543,12 +543,6 @@ class Database:
 • ⭐️ <b>Покупку звёзд</b>
 • 🎡 <b>Участие в рулетке</b>
 • 🗂️ <b>Каталог цифровых товаров</b>''',
-            'about_text_en': '''<b>🌟 About Jet Store Service</b>
-
-We provide:
-• ⭐️ <b>Star purchase</b>
-• 🎡 <b>Roulette participation</b>
-• 🗂️ <b>Digital goods catalog</b>''',
             'notifications': []
         }
         self.admins = set(ADMIN_IDS)  # Админы ТОЛЬКО из кода
@@ -766,81 +760,46 @@ def is_admin(user_id: int) -> bool:
     return db.is_admin(user_id)
 
 def get_main_menu(language: str = 'ru'):
-    """Главное меню на выбранном языке (две кнопки: открыть приложение / подписаться на канал)"""
-    if language == 'en':
-        keyboard = [
-            [
-                InlineKeyboardButton(text="🚀 Open app", web_app=WebAppInfo(url=WEB_APP_URL)),
-            ],
-            [
-                InlineKeyboardButton(text="📰 Subscribe to channel", url="https://t.me/JetStoreApp"),
-            ],
-            [
-                InlineKeyboardButton(text="❓ Help", callback_data="help_info"),
-            ]
+    """Главное меню (только русская раскладка)"""
+    keyboard = [
+        [
+            InlineKeyboardButton(text="🚀 Открыть приложение", web_app=WebAppInfo(url=WEB_APP_URL)),
+        ],
+        [
+            InlineKeyboardButton(text="📰 Подписаться на канал", url="https://t.me/JetStoreApp"),
+        ],
+        [
+            InlineKeyboardButton(text="❓ Помощь", callback_data="help_info"),
+        ],
+        [
+            InlineKeyboardButton(text="ℹ️ О нас", callback_data="about_info"),
         ]
-    else:
-        keyboard = [
-            [
-                InlineKeyboardButton(text="🚀 Открыть приложение", web_app=WebAppInfo(url=WEB_APP_URL)),
-            ],
-            [
-                InlineKeyboardButton(text="📰 Подписаться на канал", url="https://t.me/JetStoreApp"),
-            ],
-            [
-                InlineKeyboardButton(text="❓ Помощь", callback_data="help_info"),
-            ]
-        ]
-    
+    ]
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 def get_about_menu(language: str = 'ru'):
-    """Меню 'О нас' на выбранном языке"""
-    if language == 'en':
-        keyboard = [
-            [
-                InlineKeyboardButton(text="📞 Support", url="https://t.me/L3ZTADM"),
-                InlineKeyboardButton(text="📢 Info channel", url="https://t.me/JetStoreApp")
-            ],
-            [
-                InlineKeyboardButton(text="📄 Offer agreement", 
-                                   url="https://telegra.ph/Dogovor-Oferty-02-11-4"),
-            ],
-            [
-                InlineKeyboardButton(text="📜 User agreement", 
-                                   url="https://telegra.ph/Polzovatelskoe-soglashenie-02-11-33"),
-            ],
-            [
-                InlineKeyboardButton(text="🔒 Privacy policy", 
-                                   url="https://telegra.ph/Politika-konfidecialnosti-02-11"),
-            ],
-            [
-                InlineKeyboardButton(text="🔙 Back", callback_data="back_to_main")
-            ]
+    """Меню 'О нас' (только русский текст)"""
+    keyboard = [
+        [
+            InlineKeyboardButton(text="📞 Помощь", url="https://t.me/L3ZTADM"),
+            InlineKeyboardButton(text="📢 Наш канал", url="https://t.me/JetStoreApp")
+        ],
+        [
+            InlineKeyboardButton(text="📄 Договор оферты", 
+                               url="https://telegra.ph/Dogovor-Oferty-02-11-4"),
+        ],
+        [
+            InlineKeyboardButton(text="📜 Пользовательское соглашение", 
+                               url="https://telegra.ph/Polzovatelskoe-soglashenie-02-11-33"),
+        ],
+        [
+            InlineKeyboardButton(text="🔒 Политика конфиденциальности", 
+                               url="https://telegra.ph/Politika-konfidecialnosti-02-11"),
+        ],
+        [
+            InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")
         ]
-    else:
-        keyboard = [
-            [
-                InlineKeyboardButton(text="📞 Помощь", url="https://t.me/L3ZTADM"),
-                InlineKeyboardButton(text="📢 Наш канал", url="https://t.me/JetStoreApp")
-            ],
-            [
-                InlineKeyboardButton(text="📄 Договор оферты", 
-                                   url="https://telegra.ph/Dogovor-Oferty-02-11-4"),
-            ],
-            [
-                InlineKeyboardButton(text="📜 Пользовательское соглашение", 
-                                   url="https://telegra.ph/Polzovatelskoe-soglashenie-02-11-33"),
-            ],
-            [
-                InlineKeyboardButton(text="🔒 Политика конфиденциальности", 
-                                   url="https://telegra.ph/Politika-konfidecialnosti-02-11"),
-            ],
-            [
-                InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")
-            ]
-        ]
-    
+    ]
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 def get_admin_menu():
@@ -1573,17 +1532,12 @@ async def admin_admins(callback_query: types.CallbackQuery):
 @dp.callback_query(F.data == "about_info")
 async def show_about(callback_query: types.CallbackQuery):
     """Раздел 'О нас'"""
-    user_id = callback_query.from_user.id
-    language = db.get_user_language(user_id)
-    
-    if language == 'en':
-        about_text = db.get_content('about_text_en', 'Information about service...')
-    else:
-        about_text = db.get_content('about_text_ru', 'Информация о сервисе...')
+    # Всегда используем русскоязычный текст "О сервисе"
+    about_text = db.get_content('about_text_ru', 'Информация о сервисе...')
     
     await callback_query.message.answer(
         text=about_text,
-        reply_markup=get_about_menu(language),
+        reply_markup=get_about_menu('ru'),
         parse_mode="HTML"
     )
     await callback_query.answer()
@@ -1995,6 +1949,14 @@ def setup_http_server():
                     status=429,
                 )
 
+            # Сразу фиксируем отправку в лимитах, чтобы таймер работал даже
+            # если нет IDEAS_CHAT_ID или отправка в чат по какой-то причине упала.
+            try:
+                limits[user_id] = now_ts
+                _save_json_file(IDEAS_LIMITS_FILE, limits)
+            except Exception as se:
+                logger.warning("Failed to update ideas limits file (pre-send): %s", se)
+
             header = "💡 <b>Новая идея</b>\n\n"
             user_line = ""
             if username:
@@ -2015,12 +1977,6 @@ def setup_http_server():
             if IDEAS_CHAT_ID:
                 try:
                     await bot.send_message(IDEAS_CHAT_ID, full_text, parse_mode="HTML", disable_web_page_preview=True)
-                    # сохраняем время последней успешно отправленной идеи
-                    try:
-                        limits[user_id] = now_ts
-                        _save_json_file(IDEAS_LIMITS_FILE, limits)
-                    except Exception as se:
-                        logger.warning("Failed to update ideas limits file: %s", se)
                 except Exception as e:
                     logger.warning(f"Failed to send idea to IDEAS_CHAT_ID={IDEAS_CHAT_ID}: {e}")
                     return _json_response({"success": False, "error": "send_failed", "message": "Не удалось отправить идею. Попробуйте позже."}, status=502)
