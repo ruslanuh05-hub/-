@@ -65,6 +65,13 @@ PREMIUM_PRICES_RUB = {
     6: float(os.getenv("PREMIUM_PRICE_6M", "1311") or "1311"),
     12: float(os.getenv("PREMIUM_PRICE_12M", "2377") or "2377"),
 }
+# Курс Steam: 1 рубль на Steam = X ₽ (из админки / env); при POST /api/steam-rate обновляется в памяти
+_steam_rate_rub_override: Optional[float] = None
+def _get_steam_rate_rub() -> float:
+    if _steam_rate_rub_override is not None and _steam_rate_rub_override > 0:
+        return _steam_rate_rub_override
+    return float(os.getenv("STEAM_RATE_RUB", "1.06") or "1.06")
+STEAM_RATE_RUB = float(os.getenv("STEAM_RATE_RUB", "1.06") or "1.06")  # fallback at import
 
 # Заказы на продажу звёзд из мини-приложения: order_id -> { user_id, username, first_name, last_name, stars_amount, method, payout_* }
 # После successful_payment по payload "sell_stars:order_id" отправляем уведомление и удаляем запись
@@ -702,6 +709,9 @@ def get_main_menu(language: str = 'ru'):
                 InlineKeyboardButton(text="📈 Trade on jet", web_app=WebAppInfo(url=WEB_APP_URL)),
             ],
             [
+                InlineKeyboardButton(text="📰 Channel", url="https://t.me/JetStoreApp"),
+            ],
+            [
                 InlineKeyboardButton(text="ℹ️ About us", callback_data="about_info")
             ]
         ]
@@ -710,13 +720,9 @@ def get_main_menu(language: str = 'ru'):
             [
                 InlineKeyboardButton(text="📈 Торговля на Jet", web_app=WebAppInfo(url=WEB_APP_URL)),
             ],
-
-            
             [
-                InlineKeyboardButton(text="📰 Подписаться на канал", url="https://t.me/JetStoreApp"),
+                InlineKeyboardButton(text="📰 Канал", url="https://t.me/JetStoreApp"),
             ],
-
-
             [
                 InlineKeyboardButton(text="ℹ️ О нас", callback_data="about_info")
             ]
@@ -850,6 +856,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
             logger.warning(f"Не удалось отправить тестовое уведомление о реферале пригласившему {inviter_id}: {e}")
 
     username_display = user.username and f"@{user.username}" or user.first_name or "друг"
+    language = db.get_user_language(user.id)
 
     text = (
         "Добро пожаловать в <b>Jet Store</b>! 🚀\n"
@@ -858,22 +865,8 @@ async def cmd_start(message: types.Message, state: FSMContext):
         "Выбери действие:"
     )
 
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="Открыть приложение⭐️",
-                    web_app=WebAppInfo(url=WEB_APP_URL)
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="Подписаться на канал⭐️",
-                    url="https://t.me/JetStoreApp"
-                )
-            ]
-        ]
-    )
+    # Используем стандартное меню с кнопкой отзывов
+    keyboard = get_main_menu(language)
 
     await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
 
@@ -1551,7 +1544,27 @@ async def back_to_main(callback_query: types.CallbackQuery):
     """Возврат в главное меню"""
     user_id = callback_query.from_user.id
     language = db.get_user_language(user_id)
-    await show_main_menu(callback_query.message, language)
+    
+    # Получаем текст приветствия
+    if language == 'en':
+        welcome_text = db.get_content('welcome_text_en', '👋 <b>Welcome to Jet Store!</b>\n\nChoose action:')
+    else:
+        welcome_text = db.get_content('welcome_text_ru', '👋 <b>Добро пожаловать в Jet Store!</b>\n\nВыберите действие:')
+    
+    keyboard = get_main_menu(language)
+    
+    # Редактируем сообщение вместо отправки нового
+    try:
+        await callback_query.message.edit_text(
+            text=welcome_text,
+            reply_markup=keyboard,
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        # Если редактирование не удалось (например, сообщение с фото), отправляем новое
+        logger.warning(f"Не удалось отредактировать сообщение: {e}")
+        await show_main_menu(callback_query.message, language)
+    
     await callback_query.answer()
 
 # ============ ОТМЕНА РАССЫЛКИ ============
@@ -1774,6 +1787,28 @@ def setup_http_server():
                 return p
         return USERS_DATA_PATHS[0]
     
+    # Файл заказов CryptoBot (чтобы вебхук находил заказ после перезапуска)
+    CRYPTOBOT_ORDERS_FILE = os.path.join(_script_dir, "cryptobot_orders.json")
+    
+    def _load_cryptobot_order_from_file(invoice_id: str) -> Optional[dict]:
+        try:
+            data = _read_json_file(CRYPTOBOT_ORDERS_FILE) or {}
+            return data.get(str(invoice_id)) if isinstance(data, dict) else None
+        except Exception as e:
+            logger.warning("Failed to load cryptobot order from file: %s", e)
+            return None
+    
+    def _save_cryptobot_order_to_file(invoice_id: str, order_meta: dict):
+        try:
+            data = _read_json_file(CRYPTOBOT_ORDERS_FILE) or {}
+            if not isinstance(data, dict):
+                data = {}
+            data[str(invoice_id)] = order_meta
+            with open(CRYPTOBOT_ORDERS_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.warning("Failed to save cryptobot order to file: %s", e)
+    
     # Хранилище заказов Fragment.com (через сайт fragment.com/api по cookies+hash)
     # Заказы Fragment.com (через сайт fragment.com/api по cookies+hash)
     # order_id -> meta (type, recipient, quantity, created_at)
@@ -1840,6 +1875,33 @@ def setup_http_server():
 
     app.router.add_get('/api/ton-rate', ton_rate_handler)
     app.router.add_route('OPTIONS', '/api/ton-rate', lambda r: Response(status=204, headers=_cors_headers()))
+
+    async def steam_rate_handler(request):
+        """Курс Steam: 1 рубль на Steam = X ₽ (из env / админки). GET — вернуть текущий, POST — установить (body: { steam_rate_rub: number })."""
+        global _steam_rate_rub_override
+        if request.method == "POST":
+            try:
+                body = await request.json()
+            except Exception:
+                return _json_response({"error": "bad_request", "message": "Invalid JSON"}, status=400)
+            try:
+                rate = float(body.get("steam_rate_rub") or body.get("steam_rate") or 0)
+            except (TypeError, ValueError):
+                return _json_response({"error": "bad_request", "message": "steam_rate_rub должен быть числом"}, status=400)
+            if rate < 0.01 or rate > 100:
+                return _json_response({"error": "bad_request", "message": "Курс должен быть от 0.01 до 100"}, status=400)
+            _steam_rate_rub_override = rate
+            return _json_response({"steam_rate_rub": _steam_rate_rub_override})
+        try:
+            rate = _get_steam_rate_rub()
+            return _json_response({"steam_rate_rub": rate})
+        except Exception as e:
+            logger.warning("steam_rate GET error: %s", e)
+            return _json_response({"steam_rate_rub": 1.06})
+
+    app.router.add_get('/api/steam-rate', steam_rate_handler)
+    app.router.add_post('/api/steam-rate', steam_rate_handler)
+    app.router.add_route('OPTIONS', '/api/steam-rate', lambda r: Response(status=204, headers=_cors_headers()))
 
     TON_PAYMENT_ADDRESS = {"value": (os.getenv("TON_PAYMENT_ADDRESS") or "").strip()}
 
@@ -3146,13 +3208,18 @@ def setup_http_server():
                     ensure_ascii=False,
                 )[:4096]
             elif ptype == "steam":
-                # Покупка пополнения Steam: сумму указываем в рублях,
-                # логин Steam хранится в payload, чтобы вебхук мог отправить задачу FunPay‑боту.
+                # Покупка пополнения Steam: клиент передаёт amount_steam (рубли на Steam),
+                # сумма к оплате = amount_steam * STEAM_RATE_RUB (курс из админки/env).
                 try:
-                    amount_rub = float(purchase.get("amount") or 0)
+                    amount_steam = float(purchase.get("amount_steam") or purchase.get("amount") or 0)
                 except (TypeError, ValueError):
-                    amount_rub = 0.0
+                    amount_steam = 0.0
                 login = (purchase.get("login") or "").strip()
+                if amount_steam <= 0:
+                    return _json_response(
+                        {"error": "bad_request", "message": "Неверная сумма пополнения Steam"}, status=400
+                    )
+                amount_rub = round(amount_steam * _get_steam_rate_rub(), 2)
                 if amount_rub <= 0:
                     return _json_response(
                         {"error": "bad_request", "message": "Неверная сумма пополнения Steam"}, status=400
@@ -3166,13 +3233,14 @@ def setup_http_server():
                         {"error": "bad_request", "message": "Укажите логин Steam"}, status=400
                     )
                 amount = float(amount_rub)
-                description = f"Пополнение Steam для {login} на {amount_rub:.2f} ₽"
+                description = f"Пополнение Steam для {login} на {amount_steam:.0f} ₽ (к оплате {amount_rub:.2f} ₽)"
                 payload_data = json.dumps(
                     {
                         "context": "purchase",
                         "type": "steam",
                         "user_id": user_id,
                         "login": login,
+                        "amount_steam": amount_steam,
                         "amount_rub": amount_rub,
                         "timestamp": time.time(),
                     },
@@ -3208,6 +3276,10 @@ def setup_http_server():
                 },
                 ensure_ascii=False,
             )[:4096]
+
+        # Комиссия CryptoBot 4% — сумма к оплате увеличивается
+        CRYPTOBOT_COMMISSION_PERCENT = 4.0
+        amount = round(amount * (1 + CRYPTOBOT_COMMISSION_PERCENT / 100), 2)
 
         # ----------- Общие поля инвойса -----------
         paid_btn_url = WEB_APP_URL or "https://jetstoreapp.ru"
@@ -3276,16 +3348,19 @@ def setup_http_server():
                     # Сохраняем метаданные инвойса на стороне сервера,
                     # чтобы не доверять данным из клиента при последующей проверке оплаты.
                     try:
+                        order_meta = {
+                            "context": context,
+                            "user_id": user_id,
+                            "amount_rub": float(amount),
+                            "purchase": purchase if context == "purchase" else None,
+                            "created_at": time.time(),
+                            "delivered": False,
+                        }
                         orders = request.app.get("cryptobot_orders")
                         if isinstance(orders, dict) and invoice_id:
-                            orders[str(invoice_id)] = {
-                                "context": context,
-                                "user_id": user_id,
-                                "amount_rub": float(amount),
-                                "purchase": purchase if context == "purchase" else None,
-                                "created_at": time.time(),
-                                "delivered": False,
-                            }
+                            orders[str(invoice_id)] = order_meta
+                        if invoice_id:
+                            _save_cryptobot_order_to_file(str(invoice_id), order_meta)
                     except Exception as meta_err:
                         logger.warning("Failed to store cryptobot order meta: %s", meta_err)
                     return _json_response({
@@ -3340,20 +3415,25 @@ def setup_http_server():
             return _json_response({"error": "bad_request", "message": "Invalid JSON"}, status=400)
         
         update_type = body.get("update_type") or ""
-        request_data = body.get("request") or {}
-        invoice_id = request_data.get("invoice_id")
+        request_data = body.get("request") or body
+        invoice_id = request_data.get("invoice_id") or body.get("invoice_id")
+        if invoice_id is not None:
+            invoice_id = int(invoice_id) if isinstance(invoice_id, (int, float)) else invoice_id
         
         # Обрабатываем только событие оплаты инвойса
         if update_type != "invoice_paid" or not invoice_id:
             return _json_response({"ok": True, "message": "ignored"})
         
         try:
-            # Получаем метаданные инвойса
+            # Получаем метаданные инвойса (память или файл — после перезапуска заказы только в файле)
             orders = request.app.get("cryptobot_orders")
             order_meta = None
             if isinstance(orders, dict):
                 order_meta = orders.get(str(invoice_id))
-            
+            if not order_meta:
+                order_meta = _load_cryptobot_order_from_file(str(invoice_id))
+                if order_meta and isinstance(orders, dict):
+                    orders[str(invoice_id)] = order_meta
             if not order_meta:
                 logger.warning(f"CryptoBot webhook: order_meta not found for invoice_id={invoice_id}")
                 return _json_response({"ok": True, "message": "order_meta_not_found"})
@@ -3365,8 +3445,11 @@ def setup_http_server():
             
             context = order_meta.get("context")
             purchase = order_meta.get("purchase") or {}
-            user_id = order_meta.get("user_id") or "unknown"
-            amount_rub = order_meta.get("amount_rub") or 0.0
+            user_id = str(order_meta.get("user_id") or "unknown")
+            try:
+                amount_rub = float(order_meta.get("amount_rub") or 0.0)
+            except (TypeError, ValueError):
+                amount_rub = 0.0
             
             # Выдача товара в зависимости от типа покупки
             if context == "purchase":
@@ -3388,9 +3471,10 @@ def setup_http_server():
                                 tx_hash, send_err = await _ton_wallet_send_safe(tx_address, amount_nanoton, payload_decoded)
                                 if tx_hash:
                                     logger.info(f"CryptoBot webhook: stars delivered via Fragment, invoice_id={invoice_id}, recipient={recipient}, stars={stars_amount}, tx={tx_hash}")
-                                    # Помечаем как выданное
+                                    order_meta["delivered"] = True
                                     if isinstance(orders, dict):
                                         orders[str(invoice_id)]["delivered"] = True
+                                    _save_cryptobot_order_to_file(str(invoice_id), order_meta)
                                 else:
                                     logger.error(f"CryptoBot webhook: failed to deliver stars, invoice_id={invoice_id}, error={send_err}")
                         except Exception as e:
@@ -3402,18 +3486,27 @@ def setup_http_server():
                     months = int(purchase.get("months") or 0)
                     logger.info(f"CryptoBot webhook: premium purchase detected, invoice_id={invoice_id}, recipient={recipient}, months={months}")
                     # TODO: реализовать выдачу Premium через Fragment API
+                    order_meta["delivered"] = True
                     if isinstance(orders, dict):
                         orders[str(invoice_id)]["delivered"] = True
+                    _save_cryptobot_order_to_file(str(invoice_id), order_meta)
                 
                 elif purchase_type == "steam":
                     # Пополнение Steam: выдача через FunPay‑бота (отдельный сервис)
                     account = (purchase.get("login") or "").strip()
-                    amount = float(purchase.get("amount") or amount_rub)
+                    amount_steam = purchase.get("amount_steam")
+                    if amount_steam is None:
+                        amount_steam = purchase.get("amount") or amount_rub
+                    try:
+                        amount_steam = float(amount_steam)
+                    except (TypeError, ValueError):
+                        amount_steam = amount_rub
                     logger.info(
-                        "CryptoBot webhook: steam purchase detected, invoice_id=%s, account=%s, amount=%.2f",
+                        "CryptoBot webhook: steam purchase detected, invoice_id=%s, account=%s, amount_steam=%.2f, amount_rub=%.2f",
                         invoice_id,
                         account,
-                        amount,
+                        amount_steam,
+                        amount_rub,
                     )
 
                     # Настройки FunPay/уведомлений:
@@ -3427,7 +3520,8 @@ def setup_http_server():
                         "💻 Новый заказ пополнения Steam (FunPay)",
                         "",
                         f"👤 Аккаунт Steam: <code>{account or '—'}</code>",
-                        f"💰 Сумма к пополнению: <b>{amount_rub:.2f} ₽</b>",
+                        f"💰 Сумма на кошелёк Steam: <b>{amount_steam:.0f} ₽</b>",
+                        f"💵 Оплачено: <b>{amount_rub:.2f} ₽</b>",
                         f"🧾 CryptoBot invoice_id: <code>{invoice_id}</code>",
                     ]
                     if funpay_url:
@@ -3444,6 +3538,10 @@ def setup_http_server():
                                 parse_mode="HTML",
                                 disable_web_page_preview=True,
                             )
+                            if isinstance(orders, dict):
+                                orders[str(invoice_id)]["delivered"] = True
+                            order_meta["delivered"] = True
+                            _save_cryptobot_order_to_file(str(invoice_id), order_meta)
                         except Exception as send_err:
                             logger.warning(
                                 "Failed to send Steam FunPay notify to chat %s: %s",
@@ -3453,7 +3551,7 @@ def setup_http_server():
                     else:
                         logger.warning(
                             "STEAM_NOTIFY_CHAT_ID not set; Steam FunPay task will not be sent. "
-                            "Text:\n%s",
+                            "Set STEAM_NOTIFY_CHAT_ID in Railway (e.g. your Telegram chat ID). Text:\n%s",
                             notify_text,
                         )
                 
@@ -3462,6 +3560,15 @@ def setup_http_server():
                     import db as _db
                     purchase_type_str = purchase_type
                     product_name = purchase.get("productName") or purchase.get("product_name") or ""
+                    if purchase_type == "premium" and not product_name:
+                        months = int(purchase.get("months") or 0)
+                        product_name = f"Premium {months} мес." if months else "Premium"
+                    if purchase_type == "steam" and not product_name:
+                        am = purchase.get("amount_steam") or purchase.get("amount")
+                        try:
+                            product_name = f"Steam {float(am):.0f} ₽" if am is not None and float(am) > 0 else "Steam"
+                        except (TypeError, ValueError):
+                            product_name = "Steam"
                     stars_amount_for_record = int(purchase.get("stars_amount") or 0)
                     
                     if _db.is_enabled():
