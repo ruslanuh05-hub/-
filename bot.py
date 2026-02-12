@@ -286,10 +286,11 @@ async def _apply_referral_earnings_for_purchase(
     if first_name and not user_ref.get("first_name"):
         user_ref["first_name"] = first_name
 
+    # Проценты JetRefs: 1‑й уровень 4%, 2‑й — 8%, 3‑й — 12%
     parents = (
-        (user_ref.get("parent1"), 0.15),
-        (user_ref.get("parent2"), 0.20),
-        (user_ref.get("parent3"), 0.25),
+        (user_ref.get("parent1"), 0.04),
+        (user_ref.get("parent2"), 0.08),
+        (user_ref.get("parent3"), 0.12),
     )
     any_parent = False
     for pid, percent in parents:
@@ -2242,10 +2243,11 @@ def setup_http_server():
         parent3 = user_ref.get("parent3")
 
         # Пользователь сам объёмом рефералов не считается, объём идёт наверх
+        # Проценты JetRefs: 1‑й уровень 4%, 2‑й — 8%, 3‑й — 12%
         for pid, percent in (
-            (parent1, 0.15),
-            (parent2, 0.20),
-            (parent3, 0.25),
+            (parent1, 0.04),
+            (parent2, 0.08),
+            (parent3, 0.12),
         ):
             if not pid:
                 continue
