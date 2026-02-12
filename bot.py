@@ -3297,19 +3297,8 @@ def setup_http_server():
                 "message": "Set FRAGMENT_SITE_COOKIES + FRAGMENT_SITE_HASH (or FRAGMENT_COOKIES + FRAGMENT_HASH)"
             }, status=503)
         try:
-            if TON_WALLET_ENABLED:
-                await _fragment_get_recipient_address(recipient)
-                return _json_response({
-                    "success": True,
-                    "order_id": None,
-                    "payment_url": None,
-                    "stars_amount": stars_amount,
-                    "recipient": recipient,
-                    "mode": "wallet",
-                    # Более нейтральное сообщение для фронта: оплата уже открыта,
-                    # дальше пользователь просто подтверждает.
-                    "message": "Мы открыли способ оплаты. После оплаты статус обновится автоматически — звёзды будут отправлены автоматически.",
-                })
+            # ВСЕГДА используем режим fragment.com site: создаём заказ на стороне Fragment
+            # и отдаём TonKeeper-ссылку. Fragment сам доставляет звёзды после оплаты.
             res = await _fragment_site_create_star_order(request.app, recipient=recipient, stars_amount=stars_amount)
             return _json_response({
                 "success": True,
