@@ -3180,15 +3180,45 @@ def setup_http_server():
                                                 )
 
                                         elif ptype == "stars":
-                                            # Здесь пока не запускаем Fragment-выдачу напрямую, так как
-                                            # сейчас используется сайт fragment.com и/или TonKeeper/webhook.
-                                            # Главное — не доверять данным от клиента.
-                                            try:
-                                                orders = request.app.get("cryptobot_orders")
-                                                if isinstance(orders, dict):
-                                                    orders[str(invoice_id)]["delivered"] = True
-                                            except Exception as upd_err:
-                                                logger.warning("Failed to mark cryptobot order delivered: %s", upd_err)
+                                            # Fallback для звёзд: если webhook не сработал,
+                                            # запускаем выдачу звёзд через Fragment прямо из /api/payment/check.
+                                            recipient = (purchase_meta.get("login") or "").strip().lstrip("@")
+                                            stars_amount = int(purchase_meta.get("stars_amount") or 0)
+                                            if recipient and stars_amount >= 50 and TON_WALLET_ENABLED:
+                                                try:
+                                                    _, recipient_address = await _fragment_get_recipient_address(recipient)
+                                                    req_id = await _fragment_init_buy(recipient_address, stars_amount)
+                                                    tx_address, amount_nanoton, payload_b64 = await _fragment_get_buy_link(req_id)
+                                                    payload_decoded = _fragment_encoded(payload_b64)
+                                                    tx_hash, send_err = await _ton_wallet_send_safe(tx_address, amount_nanoton, payload_decoded)
+                                                    if tx_hash:
+                                                        logger.info(
+                                                            "CryptoBot payment_check: stars delivered via Fragment, invoice_id=%s, recipient=%s, stars=%s, tx=%s",
+                                                            invoice_id,
+                                                            recipient,
+                                                            stars_amount,
+                                                            tx_hash,
+                                                        )
+                                                        order_meta["delivered"] = True
+                                                        try:
+                                                            orders = request.app.get("cryptobot_orders")
+                                                            if isinstance(orders, dict):
+                                                                orders[str(invoice_id)]["delivered"] = True
+                                                        except Exception:
+                                                            pass
+                                                        _save_cryptobot_order_to_file(str(invoice_id), order_meta)
+                                                    else:
+                                                        logger.error(
+                                                            "CryptoBot payment_check: failed to deliver stars, invoice_id=%s, error=%s",
+                                                            invoice_id,
+                                                            send_err,
+                                                        )
+                                                except Exception as star_err:
+                                                    logger.exception(
+                                                        "CryptoBot payment_check: error delivering stars for invoice_id=%s: %s",
+                                                        invoice_id,
+                                                        star_err,
+                                                    )
 
                                     return _json_response(response_data)
             except Exception as e:
