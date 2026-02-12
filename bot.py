@@ -3962,6 +3962,12 @@ def setup_http_server():
     app.router.add_route("OPTIONS", "/api/cryptobot/check-invoice", lambda r: Response(status=204, headers=_cors_headers()))
     # Webhook CryptoBot: принимаем ЛЮБОЙ метод, чтобы не ловить 405 от тестов
     app.router.add_route("*", "/api/cryptobot/webhook", cryptobot_webhook_handler)
+
+    # Health-check для Railway: чтобы не было 404 на /api/health
+    async def health_handler(request):
+        return _json_response({"status": "ok"})
+
+    app.router.add_get("/api/health", health_handler)
     
     # Рейтинг покупателей
     RATING_DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rating_data.json")
