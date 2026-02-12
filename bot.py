@@ -32,6 +32,12 @@ from telethon import TelegramClient
 from telethon.errors import UsernameInvalidError, UsernameNotOccupiedError
 from telethon.sessions import StringSession
 
+try:
+    # Библиотека для работы с Fragment (Stars, Premium, TON)
+    from FragmentAPI import AsyncFragmentAPI  # type: ignore
+except Exception:  # pragma: no cover - опциональная зависимость
+    AsyncFragmentAPI = None  # type: ignore
+
 # Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
@@ -2728,6 +2734,33 @@ def setup_http_server():
         MNEMONIC = []
     TON_WALLET_ENABLED = bool(TONAPI_KEY and len(MNEMONIC) >= 24)
 
+    # Клиент fragment-api-py (для Telegram Premium через Fragment)
+    _FRAGMENT_API_CLIENT: Optional["AsyncFragmentAPI"] = None  # type: ignore[valid-type]
+
+    async def _get_fragment_api_client() -> "AsyncFragmentAPI":  # type: ignore[valid-type]
+        """
+        Ленивая инициализация AsyncFragmentAPI.
+        Используем те же cookies/hash/mnemonic/TONAPI_KEY, что и для выдачи звёзд.
+        """
+        if AsyncFragmentAPI is None:
+            raise RuntimeError("fragment-api-py не установлен. Добавьте fragment-api-py в зависимости.")
+        if not FRAGMENT_SITE_ENABLED:
+            raise RuntimeError("FRAGMENT_SITE_COOKIES/FRAGMENT_SITE_HASH не настроены для Fragment.")
+        if not TON_WALLET_ENABLED:
+            raise RuntimeError("TONAPI_KEY/MNEMONIC не настроены для кошелька бота.")
+
+        global _FRAGMENT_API_CLIENT
+        if _FRAGMENT_API_CLIENT is None:
+            wallet_version = os.getenv("WALLET_VERSION", "V4R2")
+            _FRAGMENT_API_CLIENT = AsyncFragmentAPI(
+                cookies=FRAGMENT_SITE_COOKIES,
+                hash_value=FRAGMENT_SITE_HASH,
+                wallet_mnemonic=_mnemonic_raw,
+                wallet_api_key=TONAPI_KEY,
+                wallet_version=wallet_version,
+            )
+        return _FRAGMENT_API_CLIENT
+
     def _fragment_site_headers(*, referer: str) -> dict:
         return {
             "accept": "application/json, text/javascript, */*; q=0.01",
@@ -3723,15 +3756,68 @@ def setup_http_server():
                             logger.exception(f"CryptoBot webhook: error delivering stars for invoice_id={invoice_id}: {e}")
                 
                 elif purchase_type == "premium":
-                    # Выдача Premium (если будет реализовано)
+                    # Автоматическая выдача Telegram Premium через Fragment (как со звёздами)
                     recipient = (purchase.get("login") or "").strip().lstrip("@")
                     months = int(purchase.get("months") or 0)
-                    logger.info(f"CryptoBot webhook: premium purchase detected, invoice_id={invoice_id}, recipient={recipient}, months={months}")
-                    # TODO: реализовать выдачу Premium через Fragment API
-                    order_meta["delivered"] = True
-                    if isinstance(orders, dict):
-                        orders[str(invoice_id)]["delivered"] = True
-                    _save_cryptobot_order_to_file(str(invoice_id), order_meta)
+                    logger.info(
+                        "CryptoBot webhook: premium purchase detected, invoice_id=%s, recipient=%s, months=%s",
+                        invoice_id,
+                        recipient,
+                        months,
+                    )
+
+                    delivered_ok = False
+                    if recipient and months in (3, 6, 12):
+                        try:
+                            if FRAGMENT_SITE_ENABLED and TON_WALLET_ENABLED:
+                                api = await _get_fragment_api_client()
+                                # Покупаем/дарим Premium получателю через Fragment
+                                result = await api.gift_premium(recipient, months, show_sender=False)
+                                if getattr(result, "success", False):
+                                    tx_hash = getattr(result, "transaction_hash", None)
+                                    logger.info(
+                                        "CryptoBot webhook: premium delivered via Fragment, invoice_id=%s, recipient=%s, months=%s, tx=%s",
+                                        invoice_id,
+                                        recipient,
+                                        months,
+                                        tx_hash,
+                                    )
+                                    delivered_ok = True
+                                else:
+                                    logger.error(
+                                        "CryptoBot webhook: gift_premium failed, invoice_id=%s, recipient=%s, months=%s, error=%s",
+                                        invoice_id,
+                                        recipient,
+                                        months,
+                                        getattr(result, "error", None),
+                                    )
+                            else:
+                                logger.warning(
+                                    "CryptoBot webhook: Fragment Premium not configured (FRAGMENT_SITE_ENABLED=%s, TON_WALLET_ENABLED=%s)",
+                                    FRAGMENT_SITE_ENABLED,
+                                    TON_WALLET_ENABLED,
+                                )
+                        except Exception as e:
+                            logger.exception(
+                                "CryptoBot webhook: error delivering premium via Fragment, invoice_id=%s, recipient=%s, months=%s: %s",
+                                invoice_id,
+                                recipient,
+                                months,
+                                e,
+                            )
+                    else:
+                        logger.warning(
+                            "CryptoBot webhook: invalid premium params, invoice_id=%s, recipient=%s, months=%s",
+                            invoice_id,
+                            recipient,
+                            months,
+                        )
+
+                    if delivered_ok:
+                        order_meta["delivered"] = True
+                        if isinstance(orders, dict):
+                            orders[str(invoice_id)]["delivered"] = True
+                        _save_cryptobot_order_to_file(str(invoice_id), order_meta)
                 
                 elif purchase_type == "steam":
                     # Пополнение Steam: выдача через FunPay‑бота (отдельный сервис)
