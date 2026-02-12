@@ -2933,15 +2933,17 @@ def setup_http_server():
             return (None, err)
 
     async def _fragment_site_create_star_order(app_: web.Application, *, recipient: str, stars_amount: int) -> dict:
-        """Создание заказа: только валидация + при наличии кошелька не отдаём ссылку (оплата через CryptoBot, затем deliver-stars)."""
+        """Создание заказа на звёзды через fragment.com/stars.
+        Раньше при наличии TON_WALLET_ENABLED мы делали только валидацию и не отдавали ссылку (режим CryptoBot+кошелёк бота).
+        Сейчас ВСЕГДА создаём полноценный заказ и отдаём payment_url, чтобы пользователь оплачивал напрямую через TonKeeper,
+        а Fragment сам доставлял звёзды получателю.
+        """
         referer = f"https://fragment.com/stars/buy?recipient={recipient}&quantity={stars_amount}"
         search_payload = {"query": recipient, "quantity": "", "method": "searchStarsRecipient"}
         search = await _fragment_site_post(search_payload, referer=referer)
         found = (search or {}).get("found")
         if not found or not isinstance(found, dict) or not found.get("recipient"):
             raise RuntimeError("Fragment: получатель не найден")
-        if TON_WALLET_ENABLED:
-            return {"success": True, "order_id": None, "payment_url": None, "mode": "wallet"}
         address = found.get("recipient")
         init_payload = {"recipient": address, "quantity": int(stars_amount), "method": "initBuyStarsRequest"}
         init = await _fragment_site_post(init_payload, referer=referer)
