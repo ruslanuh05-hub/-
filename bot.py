@@ -3971,61 +3971,29 @@ def setup_http_server():
                         )
 
                     if delivered_ok:
+                        # Фиксируем, что премиум выдан, но в рейтинг НЕ добавляем (рейтинг только за звёзды)
                         order_meta["delivered"] = True
                         if isinstance(orders, dict):
                             orders[str(invoice_id)]["delivered"] = True
                         _save_cryptobot_order_to_file(str(invoice_id), order_meta)
-                        
-                        # Записываем покупку Premium в базу данных (рейтинг) + начисляем рефералы
+
+                        # Начисление реферальных бонусов за покупку премиума (без влияния на рейтинг)
                         try:
-                            import db as _db
-                            purchase_type_str = "premium"
-                            product_name = purchase.get("productName") or purchase.get("product_name") or f"Premium {months} мес."
-                            
-                            if _db.is_enabled():
-                                await _db.user_upsert(user_id, purchase.get("username") or "", purchase.get("first_name") or "")
-                                await _db.purchase_add(user_id, amount_rub, 0, purchase_type_str, product_name)
-                            else:
-                                # Fallback на JSON файл
-                                path = _get_users_data_path()
-                                users_data = _read_json_file(path) or {}
-                                if user_id not in users_data:
-                                    users_data[user_id] = {
-                                        "id": int(user_id) if user_id.isdigit() else user_id,
-                                        "username": purchase.get("username") or "",
-                                        "first_name": purchase.get("first_name") or "",
-                                        "purchases": [],
-                                    }
-                                u = users_data[user_id]
-                                if "purchases" not in u:
-                                    u["purchases"] = []
-                                u["purchases"].append({
-                                    "stars_amount": 0,
-                                    "amount": amount_rub,
-                                    "type": purchase_type_str,
-                                    "productName": product_name,
-                                    "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                                })
-                                try:
-                                    with open(path, "w", encoding="utf-8") as f:
-                                        json.dump(users_data, f, ensure_ascii=False, indent=2)
-                                except Exception as file_err:
-                                    logger.warning(f"Failed to write users_data.json (webhook premium): {file_err}")
-                            
-                            # Начисление рефералов
-                            try:
-                                await _apply_referral_earnings_for_purchase(
-                                    user_id=user_id,
-                                    amount_rub=amount_rub,
-                                    username=purchase.get("username") or "",
-                                    first_name=purchase.get("first_name") or "",
-                                )
-                            except Exception as ref_err:
-                                logger.warning(f"Failed to update referral earnings (webhook premium): {ref_err}")
-                            
-                            logger.info(f"CryptoBot webhook: premium purchase recorded, invoice_id={invoice_id}, user_id={user_id}, amount_rub={amount_rub}")
-                        except Exception as record_err:
-                            logger.exception(f"CryptoBot webhook: error recording premium purchase for invoice_id={invoice_id}: {record_err}")
+                            await _apply_referral_earnings_for_purchase(
+                                user_id=user_id,
+                                amount_rub=amount_rub,
+                                username=purchase.get("username") or "",
+                                first_name=purchase.get("first_name") or "",
+                            )
+                        except Exception as ref_err:
+                            logger.warning(f"Failed to update referral earnings (webhook premium): {ref_err}")
+
+                        logger.info(
+                            "CryptoBot webhook: premium delivered and referral updated, invoice_id=%s, user_id=%s, amount_rub=%s",
+                            invoice_id,
+                            user_id,
+                            amount_rub,
+                        )
                 
                 elif purchase_type == "steam":
                     # Пополнение Steam: выдача через FunPay‑бота (отдельный сервис)
@@ -4090,46 +4058,6 @@ def setup_http_server():
                             "Set STEAM_NOTIFY_CHAT_ID in Railway (e.g. your Telegram chat ID). Text:\n%s",
                             notify_text,
                         )
-                    
-                    # Записываем покупку Steam в базу данных (рейтинг) + начисляем рефералы
-                    try:
-                        import db as _db
-                        purchase_type_str = "steam"
-                        am = purchase.get("amount_steam") or purchase.get("amount")
-                        try:
-                            product_name = f"Steam {float(am):.0f} ₽" if am is not None and float(am) > 0 else "Steam"
-                        except (TypeError, ValueError):
-                            product_name = "Steam"
-                        
-                        if _db.is_enabled():
-                            await _db.user_upsert(user_id, purchase.get("username") or "", purchase.get("first_name") or "")
-                            await _db.purchase_add(user_id, amount_rub, 0, purchase_type_str, product_name)
-                        else:
-                            # Fallback на JSON файл
-                            path = _get_users_data_path()
-                            users_data = _read_json_file(path) or {}
-                            if user_id not in users_data:
-                                users_data[user_id] = {
-                                    "id": int(user_id) if user_id.isdigit() else user_id,
-                                    "username": purchase.get("username") or "",
-                                    "first_name": purchase.get("first_name") or "",
-                                    "purchases": [],
-                                }
-                            u = users_data[user_id]
-                            if "purchases" not in u:
-                                u["purchases"] = []
-                            u["purchases"].append({
-                                "stars_amount": 0,
-                                "amount": amount_rub,
-                                "type": purchase_type_str,
-                                "productName": product_name,
-                                "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                            })
-                            try:
-                                with open(path, "w", encoding="utf-8") as f:
-                                    json.dump(users_data, f, ensure_ascii=False, indent=2)
-                            except Exception as file_err:
-                                logger.warning(f"Failed to write users_data.json (webhook steam): {file_err}")
 
                         # Начисление рефералов
                         try:
@@ -4333,7 +4261,8 @@ def setup_http_server():
             if amount_rub <= 0:
                 return _json_response({"error": "amount_rub must be > 0"}, status=400)
             
-            if not referral_only:
+            # В рейтинг попадают только звёзды: игнорируем другие типы покупок
+            if not referral_only and purchase_type == "stars":
                 import db as _db
                 if _db.is_enabled():
                     await _db.user_upsert(user_id, username, first_name)
