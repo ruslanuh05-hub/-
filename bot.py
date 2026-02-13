@@ -2016,6 +2016,16 @@ def setup_http_server():
     
     app.router.add_get('/api/config', api_config_handler)
 
+    # Отдаём robots.txt, чтобы боты (например, Яндекс) не вызывали 404 и не засоряли логи
+    async def robots_handler(request):
+        """
+        Простой robots.txt: разрешаем всё, но главное — не даём 404.
+        """
+        text = "User-agent: *\nAllow: /\n"
+        return web.Response(text=text, content_type="text/plain", charset="utf-8")
+
+    app.router.add_get('/robots.txt', robots_handler)
+
     # Поиск заказа по пользовательскому ID вида #ABC123
     async def _find_order_by_custom_id(order_id: str) -> tuple | None:
         """
@@ -3358,6 +3368,7 @@ def setup_http_server():
                                                             user_id = str(order_meta.get("user_id") or "unknown")
                                                             purchase_type_str = "stars"
                                                             product_name = f"{stars_amount} звёзд"
+                                                            order_id_custom = str(purchase_meta.get("order_id") or "").strip() or None
                                                             import db as _db
                                                             if _db.is_enabled():
                                                                 await _db.user_upsert(
@@ -3371,6 +3382,7 @@ def setup_http_server():
                                                                     stars_amount,
                                                                     purchase_type_str,
                                                                     product_name,
+                                                                    order_id_custom,
                                                                 )
                                                             else:
                                                                 # Fallback на JSON файл
@@ -4007,10 +4019,11 @@ def setup_http_server():
                                         import db as _db
                                         purchase_type_str = "stars"
                                         product_name = purchase.get("productName") or purchase.get("product_name") or f"{stars_amount} звёзд"
+                                        order_id_custom = str(purchase.get("order_id") or "").strip() or None
                                         
                                         if _db.is_enabled():
                                             await _db.user_upsert(user_id, purchase.get("username") or "", purchase.get("first_name") or "")
-                                            await _db.purchase_add(user_id, amount_rub, stars_amount, purchase_type_str, product_name)
+                                            await _db.purchase_add(user_id, amount_rub, stars_amount, purchase_type_str, product_name, order_id_custom)
                                         else:
                                             # Fallback на JSON файл
                                             path = _get_users_data_path()
@@ -4414,7 +4427,8 @@ def setup_http_server():
                 import db as _db
                 if _db.is_enabled():
                     await _db.user_upsert(user_id, username, first_name)
-                    await _db.purchase_add(user_id, amount_rub, stars_amount, purchase_type, product_name)
+                    # Для старого/ручного эндпоинта order_id не передаём (None)
+                    await _db.purchase_add(user_id, amount_rub, stars_amount, purchase_type, product_name, None)
                 else:
                     path = _get_users_data_path()
                     users_data = _read_json_file(path) or {}

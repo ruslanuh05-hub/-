@@ -238,15 +238,15 @@ async def user_upsert(user_id: str, username: str = "", first_name: str = ""):
         """, user_id, username or "", first_name or "")
 
 
-async def purchase_add(user_id: str, amount_rub: float, stars_amount: int, ptype: str, product_name: str):
-    """Добавить покупку."""
+async def purchase_add(user_id: str, amount_rub: float, stars_amount: int, ptype: str, product_name: str, order_id: str | None = None):
+    """Добавить покупку. order_id — наш внешний ID (#ABC123), может быть None."""
     if not _db_enabled:
         return
     async with _pool.acquire() as conn:
         await conn.execute("""
-            INSERT INTO purchases (user_id, amount_rub, stars_amount, type, product_name)
-            VALUES ($1, $2, $3, $4, $5)
-        """, user_id, amount_rub, stars_amount or int(amount_rub / 0.65), ptype or "stars", product_name or "")
+            INSERT INTO purchases (user_id, amount_rub, stars_amount, type, product_name, order_id)
+            VALUES ($1, $2, $3, $4, $5, $6)
+        """, user_id, amount_rub, stars_amount or int(amount_rub / 0.65), ptype or "stars", product_name or "", order_id or None)
 
 
 async def get_users_with_purchases() -> dict:
