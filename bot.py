@@ -3212,16 +3212,7 @@ def setup_http_server():
                 return _json_response({"paid": False})
             # Продолжаем проверку только с invoice_id
         else:
-            # Для других методов (Fragment, TON) используем старую логику
-        purchase = body.get("purchase") or {}
-        purchase_type = (purchase.get("type") or purchase.get("Type") or "").strip()
-        is_stars = purchase_type == "stars" or (purchase.get("stars_amount") is not None and purchase.get("stars_amount") != 0)
-        is_premium = purchase_type == "premium" or (purchase.get("months") is not None and purchase.get("months") != 0)
-        order_id = (body.get("order_id") or body.get("orderId") or "").strip()
-        transaction_id = (body.get("transaction_id") or body.get("transactionId") or "").strip()
-        # Для CryptoBot проверяем только invoice_id (логика ниже)
-        # Для других методов - проверяем Fragment/TON
-        if method != "cryptobot":
+            # Для других методов (Fragment, TON, Platega) используем purchase, order_id, transaction_id из body
             purchase = body.get("purchase") or {}
             purchase_type = (purchase.get("type") or purchase.get("Type") or "").strip()
             is_stars = purchase_type == "stars" or (purchase.get("stars_amount") is not None and purchase.get("stars_amount") != 0)
