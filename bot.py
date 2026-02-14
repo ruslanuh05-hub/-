@@ -2066,6 +2066,12 @@ def setup_http_server():
 
     app.router.add_get('/robots.txt', robots_handler)
 
+    # Favicon — чтобы браузеры и проверки не давали 404/500 в логах
+    async def favicon_handler(request):
+        return web.Response(status=204)
+
+    app.router.add_get('/favicon.ico', favicon_handler)
+
     # Поиск заказа по пользовательскому ID вида #ABC123
     async def _find_order_by_custom_id(order_id: str) -> tuple | None:
         """
@@ -4625,6 +4631,8 @@ def setup_http_server():
     # Platega.io: callback при изменении статуса транзакции
     async def platega_callback_handler(request):
         """POST от Platega при смене статуса. Проверяем X-MerchantId, X-Secret; при CONFIRMED — выдача товара."""
+        if request.method == "OPTIONS":
+            return Response(status=204, headers=_cors_headers())
         if request.method != "POST":
             return web.Response(status=200, text="OK")
         merchant_id = request.headers.get("X-MerchantId") or request.headers.get("x-merchantid")
@@ -4765,8 +4773,8 @@ def setup_http_server():
         return Response(status=204, headers=_cors_headers())
     app.router.add_route("OPTIONS", "/api/platega/create-transaction", platega_create_options)
     app.router.add_post("/api/platega/create-transaction", platega_create_transaction_handler)
-    app.router.add_route("OPTIONS", "/api/platega/callback", lambda r: Response(status=204, headers=_cors_headers()))
-    app.router.add_post("/api/platega/callback", platega_callback_handler)
+    # Callback Platega: один маршрут на любой метод (как webhook CryptoBot), чтобы POST точно находился
+    app.router.add_route("*", "/api/platega/callback", platega_callback_handler)
 
     # Health-check для Railway: чтобы не было 404 на /api/health
     async def health_handler(request):
