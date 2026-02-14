@@ -85,6 +85,18 @@ def _get_steam_rate_rub() -> float:
     return float(os.getenv("STEAM_RATE_RUB", "1.06") or "1.06")
 STEAM_RATE_RUB = float(os.getenv("STEAM_RATE_RUB", "1.06") or "1.06")  # fallback at import
 
+# Комиссия Platega (из админки / env): СБП % и Карты %
+_platega_sbp_commission_override: Optional[float] = None
+_platega_cards_commission_override: Optional[float] = None
+def _get_platega_sbp_commission() -> float:
+    if _platega_sbp_commission_override is not None and _platega_sbp_commission_override >= 0:
+        return _platega_sbp_commission_override
+    return float(os.getenv("PLATEGA_SBP_COMMISSION_PERCENT", "10") or "10")
+def _get_platega_cards_commission() -> float:
+    if _platega_cards_commission_override is not None and _platega_cards_commission_override >= 0:
+        return _platega_cards_commission_override
+    return float(os.getenv("PLATEGA_CARDS_COMMISSION_PERCENT", "14") or "14")
+
 # Заказы на продажу звёзд из мини-приложения: order_id -> { user_id, username, first_name, last_name, stars_amount, method, payout_* }
 # После successful_payment по payload "sell_stars:order_id" отправляем уведомление и удаляем запись
 PENDING_SELL_STARS_ORDERS: dict[str, dict] = {}
@@ -807,42 +819,42 @@ def is_admin(user_id: int) -> bool:
 
 def get_main_menu(language: str = 'ru'):
     """Главное меню (только русская раскладка)"""
-    keyboard = [
-        [
+        keyboard = [
+            [
             InlineKeyboardButton(text="🚀 Открыть приложение", web_app=WebAppInfo(url=WEB_APP_URL)),
         ],
-        [
-            InlineKeyboardButton(text="📰 Подписаться на канал", url="https://t.me/JetStoreApp"),
-        ],
-        [
+            [
+                InlineKeyboardButton(text="📰 Подписаться на канал", url="https://t.me/JetStoreApp"),
+            ],
+            [
             InlineKeyboardButton(text="❓ Помощь", callback_data="help_info"),
+            ]
         ]
-    ]
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 def get_about_menu(language: str = 'ru'):
     """Меню 'О нас' (только русский текст)"""
-    keyboard = [
-        [
+        keyboard = [
+            [
             InlineKeyboardButton(text="📞 Помощь", url="https://t.me/L3ZTADM"),
             InlineKeyboardButton(text="📢 Наш канал", url="https://t.me/JetStoreApp")
         ],
         [
             InlineKeyboardButton(text="📄 Договор оферты", 
                                url="https://telegra.ph/Dogovor-Oferty-02-11-4"),
-        ],
-        [
-            InlineKeyboardButton(text="📜 Пользовательское соглашение", 
+            ],
+            [
+                InlineKeyboardButton(text="📜 Пользовательское соглашение", 
                                url="https://telegra.ph/Polzovatelskoe-soglashenie-02-11-33"),
-        ],
-        [
-            InlineKeyboardButton(text="🔒 Политика конфиденциальности", 
+            ],
+            [
+                InlineKeyboardButton(text="🔒 Политика конфиденциальности", 
                                url="https://telegra.ph/Politika-konfidecialnosti-02-11"),
-        ],
-        [
-            InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")
+            ],
+            [
+                InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")
+            ]
         ]
-    ]
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 def get_admin_menu():
@@ -1665,7 +1677,7 @@ async def admin_admins(callback_query: types.CallbackQuery):
 async def show_about(callback_query: types.CallbackQuery):
     """Раздел 'О нас'"""
     # Всегда используем русскоязычный текст "О сервисе"
-    about_text = db.get_content('about_text_ru', 'Информация о сервисе...')
+        about_text = db.get_content('about_text_ru', 'Информация о сервисе...')
     
     await callback_query.message.answer(
         text=about_text,
@@ -1723,7 +1735,7 @@ async def back_to_main(callback_query: types.CallbackQuery):
     except Exception as e:
         # Если редактирование не удалось (например, сообщение с фото), отправляем новое
         logger.warning(f"Не удалось отредактировать сообщение: {e}")
-        await show_main_menu(callback_query.message, language)
+    await show_main_menu(callback_query.message, language)
     
     await callback_query.answer()
 
@@ -2041,7 +2053,7 @@ def setup_http_server():
                 "domain": "jetstoreapp.ru",
                 "cryptobot_usdt_amount": CRYPTOBOT_USDT_AMOUNT,
             })
-    
+
     app.router.add_get('/api/config', api_config_handler)
 
     # Отдаём robots.txt, чтобы боты (например, Яндекс) не вызывали 404 и не засоряли логи
@@ -2232,6 +2244,32 @@ def setup_http_server():
     app.router.add_get('/api/steam-rate', steam_rate_handler)
     app.router.add_post('/api/steam-rate', steam_rate_handler)
     app.router.add_route('OPTIONS', '/api/steam-rate', lambda r: Response(status=204, headers=_cors_headers()))
+
+    # Комиссия Platega: СБП % и Карты % (GET — текущие, POST — установить из админки)
+    async def platega_commission_handler(request):
+        global _platega_sbp_commission_override, _platega_cards_commission_override
+        if request.method == "POST":
+            try:
+                body = await request.json()
+            except Exception:
+                return _json_response({"error": "bad_request", "message": "Invalid JSON"}, status=400)
+            try:
+                sbp = float(body.get("sbp_percent") or body.get("sbp") or 10)
+                cards = float(body.get("cards_percent") or body.get("cards") or 14)
+            except (TypeError, ValueError):
+                return _json_response({"error": "bad_request", "message": "sbp_percent и cards_percent должны быть числами"}, status=400)
+            if sbp < 0 or sbp > 100 or cards < 0 or cards > 100:
+                return _json_response({"error": "bad_request", "message": "Комиссия от 0 до 100%"}, status=400)
+            _platega_sbp_commission_override = sbp
+            _platega_cards_commission_override = cards
+            return _json_response({"sbp_percent": sbp, "cards_percent": cards})
+        return _json_response({
+            "sbp_percent": _get_platega_sbp_commission(),
+            "cards_percent": _get_platega_cards_commission(),
+        })
+    app.router.add_get('/api/platega-commission', platega_commission_handler)
+    app.router.add_post('/api/platega-commission', platega_commission_handler)
+    app.router.add_route('OPTIONS', '/api/platega-commission', lambda r: Response(status=204, headers=_cors_headers()))
 
     TON_PAYMENT_ADDRESS = {"value": (os.getenv("TON_PAYMENT_ADDRESS") or "").strip()}
 
@@ -3170,12 +3208,12 @@ def setup_http_server():
             # Продолжаем проверку только с invoice_id
         else:
             # Для других методов (Fragment, TON) используем старую логику
-            purchase = body.get("purchase") or {}
-            purchase_type = (purchase.get("type") or purchase.get("Type") or "").strip()
-            is_stars = purchase_type == "stars" or (purchase.get("stars_amount") is not None and purchase.get("stars_amount") != 0)
-            is_premium = purchase_type == "premium" or (purchase.get("months") is not None and purchase.get("months") != 0)
-            order_id = (body.get("order_id") or body.get("orderId") or "").strip()
-            transaction_id = (body.get("transaction_id") or body.get("transactionId") or "").strip()
+        purchase = body.get("purchase") or {}
+        purchase_type = (purchase.get("type") or purchase.get("Type") or "").strip()
+        is_stars = purchase_type == "stars" or (purchase.get("stars_amount") is not None and purchase.get("stars_amount") != 0)
+        is_premium = purchase_type == "premium" or (purchase.get("months") is not None and purchase.get("months") != 0)
+        order_id = (body.get("order_id") or body.get("orderId") or "").strip()
+        transaction_id = (body.get("transaction_id") or body.get("transactionId") or "").strip()
         # Для CryptoBot проверяем только invoice_id (логика ниже)
         # Для других методов - проверяем Fragment/TON
         if method != "cryptobot":
@@ -3533,10 +3571,10 @@ def setup_http_server():
                                                         logger.warning(f"Failed to apply referral earnings for Steam (payment_check): {ref_err}")
 
                                                     order_meta["delivered"] = True
-                                                    try:
-                                                        orders = request.app.get("cryptobot_orders")
-                                                        if isinstance(orders, dict):
-                                                            orders[str(invoice_id)]["delivered"] = True
+                                            try:
+                                                orders = request.app.get("cryptobot_orders")
+                                                if isinstance(orders, dict):
+                                                    orders[str(invoice_id)]["delivered"] = True
                                                     except Exception:
                                                         pass
                                                     _save_cryptobot_order_to_file(str(invoice_id), order_meta)
@@ -3676,8 +3714,8 @@ def setup_http_server():
             is_stars = purchase_type == "stars" or (purchase.get("stars_amount") is not None and purchase.get("stars_amount") != 0)
             is_premium = purchase_type == "premium" or (purchase.get("months") is not None and purchase.get("months") != 0)
             order_id = (body.get("order_id") or body.get("orderId") or "").strip()
-            if is_stars or is_premium:
-                return _json_response({"paid": False, "order_id": order_id or None})
+        if is_stars or is_premium:
+            return _json_response({"paid": False, "order_id": order_id or None})
         
         return _json_response({"paid": False})
     
@@ -4080,13 +4118,13 @@ def setup_http_server():
                     # чтобы не доверять данным из клиента при последующей проверке оплаты.
                     try:
                         order_meta = {
-                            "context": context,
-                            "user_id": user_id,
-                            "amount_rub": float(amount),
-                            "purchase": purchase if context == "purchase" else None,
-                            "created_at": time.time(),
-                            "delivered": False,
-                        }
+                                "context": context,
+                                "user_id": user_id,
+                                "amount_rub": float(amount),
+                                "purchase": purchase if context == "purchase" else None,
+                                "created_at": time.time(),
+                                "delivered": False,
+                            }
                         orders = request.app.get("cryptobot_orders")
                         if isinstance(orders, dict) and invoice_id:
                             orders[str(invoice_id)] = order_meta
@@ -4516,6 +4554,9 @@ def setup_http_server():
         payment_method_int = int(body.get("platega_method") or body.get("payment_method") or 10)
         if payment_method_int not in (2, 10):
             payment_method_int = 10
+        # Комиссия Platega: СБП (2) и Карты (10) — из админки / env
+        commission_pct = _get_platega_sbp_commission() if payment_method_int == 2 else _get_platega_cards_commission()
+        amount = round(amount * (1 + commission_pct / 100), 2)
         base_url = (WEB_APP_URL or "https://jetstoreapp.ru").rstrip("/")
         return_url = body.get("return_url") or f"{base_url}?platega=success"
         failed_url = body.get("failed_url") or f"{base_url}?platega=fail"
@@ -4711,7 +4752,7 @@ def setup_http_server():
         except Exception as e:
             logger.exception("Platega callback delivery error for %s: %s", tid, e)
         return web.Response(status=200, text="OK")
-    
+
     app.router.add_post("/api/cryptobot/create-invoice", cryptobot_create_invoice_handler)
     app.router.add_route("OPTIONS", "/api/cryptobot/create-invoice", lambda r: Response(status=204, headers=_cors_headers()))
     app.router.add_post("/api/cryptobot/check-invoice", cryptobot_check_invoice_handler)
@@ -4719,11 +4760,13 @@ def setup_http_server():
     # Webhook CryptoBot: принимаем ЛЮБОЙ метод, чтобы не ловить 405 от тестов
     app.router.add_route("*", "/api/cryptobot/webhook", cryptobot_webhook_handler)
 
-    # Platega.io: карты и СБП
+    # Platega.io: карты и СБП — OPTIONS регистрируем первым, чтобы CORS preflight не давал Not Found
+    async def platega_create_options(request):
+        return Response(status=204, headers=_cors_headers())
+    app.router.add_route("OPTIONS", "/api/platega/create-transaction", platega_create_options)
     app.router.add_post("/api/platega/create-transaction", platega_create_transaction_handler)
-    app.router.add_route("OPTIONS", "/api/platega/create-transaction", lambda r: Response(status=204, headers=_cors_headers()))
-    app.router.add_post("/api/platega/callback", platega_callback_handler)
     app.router.add_route("OPTIONS", "/api/platega/callback", lambda r: Response(status=204, headers=_cors_headers()))
+    app.router.add_post("/api/platega/callback", platega_callback_handler)
 
     # Health-check для Railway: чтобы не было 404 на /api/health
     async def health_handler(request):
