@@ -2024,6 +2024,25 @@ def setup_http_server():
     except Exception:
         app["platega_orders"] = {}
 
+    # Комиссия Platega: сохраняем в файл, чтобы переживала перезапуск бота
+    PLATEGA_COMMISSION_FILE = os.path.join(_script_dir, "platega_commission.json")
+
+    def _load_platega_commission_from_file():
+        global _platega_sbp_commission_override, _platega_cards_commission_override
+        try:
+            data = _read_json_file(PLATEGA_COMMISSION_FILE) or {}
+            if isinstance(data, dict):
+                sbp = data.get("sbp_percent")
+                cards = data.get("cards_percent")
+                if sbp is not None and sbp != "":
+                    _platega_sbp_commission_override = float(sbp)
+                if cards is not None and cards != "":
+                    _platega_cards_commission_override = float(cards)
+        except Exception as e:
+            logger.warning("Failed to load Platega commission from file: %s", e)
+
+    _load_platega_commission_from_file()
+
     # Preflight для CORS
     app.router.add_route('OPTIONS', '/api/telegram/user', lambda r: Response(status=204, headers={
         'Access-Control-Allow-Origin': '*',
@@ -2273,6 +2292,10 @@ def setup_http_server():
                 return _json_response({"error": "bad_request", "message": "Комиссия от 0 до 100%"}, status=400)
             _platega_sbp_commission_override = sbp
             _platega_cards_commission_override = cards
+            try:
+                _save_json_file(PLATEGA_COMMISSION_FILE, {"sbp_percent": sbp, "cards_percent": cards})
+            except Exception as e:
+                logger.warning("Failed to save Platega commission to file: %s", e)
             return _json_response({"sbp_percent": sbp, "cards_percent": cards})
         return _json_response({
             "sbp_percent": _get_platega_sbp_commission(),
