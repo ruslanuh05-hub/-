@@ -69,10 +69,13 @@ async def _ensure_schema():
                 stars_amount INTEGER DEFAULT 0,
                 type TEXT DEFAULT 'stars',
                 product_name TEXT DEFAULT '',
+                order_id TEXT,
                 created_at TIMESTAMPTZ DEFAULT NOW()
             )
         """)
         logger.info("PostgreSQL: ensured table 'purchases'")
+        # Миграция: добавить order_id, если таблица создана без неё (старые инсталлы)
+        await conn.execute("ALTER TABLE purchases ADD COLUMN IF NOT EXISTS order_id TEXT")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_purchases_user ON purchases(user_id)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_purchases_created ON purchases(created_at)")
         logger.info("PostgreSQL: ensured indexes idx_purchases_user, idx_purchases_created")

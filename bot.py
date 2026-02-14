@@ -204,13 +204,13 @@ def _save_json_file(path: str, data: dict) -> None:
 
 # Глобальный помощник: поиск заказа по нашему кастомному order_id (#ABC123)
 _CRYPTOBOT_ORDERS_FILE_GLOBAL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cryptobot_orders.json")
+_PLATEGA_ORDERS_FILE_GLOBAL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "platega_orders.json")
 
 
 async def _find_order_by_custom_id(order_id: str) -> Optional[tuple]:
     """
-    Ищет заказ CryptoBot по нашему кастомному order_id (#ABC123)
-    в файле cryptobot_orders.json.
-    Возвращает (invoice_id, meta) или None.
+    Ищет заказ по кастомному order_id (#ABC123) в cryptobot_orders.json и platega_orders.json.
+    Возвращает (source, order_key, meta): source = 'cryptobot'|'platega', order_key = invoice_id или transaction_id.
     """
     oid = (order_id or "").strip().upper()
     if not oid:
@@ -219,14 +219,21 @@ async def _find_order_by_custom_id(order_id: str) -> Optional[tuple]:
         oid = "#" + oid
     try:
         data = _read_json_file(_CRYPTOBOT_ORDERS_FILE_GLOBAL) or {}
-        if not isinstance(data, dict):
-            return None
-        for inv_id, meta in data.items():
-            if not isinstance(meta, dict):
-                continue
-            purchase_meta = meta.get("purchase") or {}
-            if str(purchase_meta.get("order_id") or "").upper() == oid:
-                return (inv_id, meta)
+        if isinstance(data, dict):
+            for inv_id, meta in data.items():
+                if not isinstance(meta, dict):
+                    continue
+                purchase_meta = meta.get("purchase") or {}
+                if str(purchase_meta.get("order_id") or "").upper() == oid:
+                    return ("cryptobot", str(inv_id), meta)
+        data = _read_json_file(_PLATEGA_ORDERS_FILE_GLOBAL) or {}
+        if isinstance(data, dict):
+            for tx_id, meta in data.items():
+                if not isinstance(meta, dict):
+                    continue
+                purchase_meta = meta.get("purchase") or {}
+                if str(purchase_meta.get("order_id") or "").upper() == oid:
+                    return ("platega", str(tx_id), meta)
     except Exception as e:
         logger.warning(f"_find_order_by_custom_id error: {e}")
     return None
@@ -1459,14 +1466,13 @@ async def process_admin_order_search(message: types.Message, state: FSMContext):
     if not raw_id.startswith("#"):
         raw_id = "#" + raw_id
     
-    # Ищем заказ в локальном хранилище CryptoBot заказов
     found = await _find_order_by_custom_id(raw_id)
     if not found:
         await message.answer(f"❌ Заказ с ID <code>{raw_id}</code> не найден.", parse_mode="HTML")
         await state.clear()
         return
     
-    invoice_id, meta = found
+    source, order_key, meta = found
     meta = meta or {}
     purchase = meta.get("purchase") or {}
     amount_rub = meta.get("amount_rub") or 0
@@ -1488,7 +1494,6 @@ async def process_admin_order_search(message: types.Message, state: FSMContext):
         except Exception:
             created_str = ""
     
-    # Описание товара
     if ptype == "stars":
         product_desc = f"Звёзды Telegram — {stars_amount} шт."
     elif ptype == "premium":
@@ -1505,10 +1510,11 @@ async def process_admin_order_search(message: types.Message, state: FSMContext):
         status_lines.append("⏳ <b>Оплата подтверждена, выдача ещё не завершена</b>")
     status_lines.append(f"💵 Сумма: <b>{float(amount_rub or 0):.2f} ₽</b>")
     
+    id_label = "Invoice ID (CryptoBot):" if source == "cryptobot" else "Transaction ID (Platega):"
     text_lines = [
         f"🔎 <b>Информация по заказу {raw_id}</b>",
         "",
-        f"🧾 <b>Invoice ID:</b> <code>{invoice_id}</code>",
+        f"🧾 <b>{id_label}</b> <code>{order_key}</code>",
         f"📦 <b>Тип:</b> {ptype or '—'}",
         f"📚 <b>Товар:</b> {product_desc}",
         "",
