@@ -2024,6 +2024,33 @@ def setup_http_server():
     except Exception:
         app["platega_orders"] = {}
 
+    # FreeKassa: MERCHANT_ORDER_ID (наш order_id, обычно вида #ABC123) -> meta
+    FREEKASSA_ORDERS_FILE = os.path.join(_script_dir, "freekassa_orders.json")
+
+    def _load_freekassa_order_from_file(order_id: str) -> Optional[dict]:
+        try:
+            data = _read_json_file(FREEKASSA_ORDERS_FILE) or {}
+            return data.get(str(order_id)) if isinstance(data, dict) else None
+        except Exception:
+            return None
+
+    def _save_freekassa_order_to_file(order_id: str, meta: dict) -> None:
+        try:
+            data = _read_json_file(FREEKASSA_ORDERS_FILE) or {}
+            if not isinstance(data, dict):
+                data = {}
+            data[str(order_id)] = meta
+            _save_json_file(FREEKASSA_ORDERS_FILE, data)
+        except Exception as e:
+            logger.warning("Failed to save FreeKassa order to file: %s", e)
+
+    try:
+        app["freekassa_orders"] = _read_json_file(FREEKASSA_ORDERS_FILE) or {}
+        if not isinstance(app["freekassa_orders"], dict):
+            app["freekassa_orders"] = {}
+    except Exception:
+        app["freekassa_orders"] = {}
+
     # Комиссия Platega: сохраняем в файл, чтобы переживала перезапуск бота
     PLATEGA_COMMISSION_FILE = os.path.join(_script_dir, "platega_commission.json")
 
@@ -2959,6 +2986,20 @@ def setup_http_server():
     PLATEGA_SECRET = os.getenv("PLATEGA_SECRET", "").strip()
     PLATEGA_BASE_URL = (os.getenv("PLATEGA_BASE_URL", "https://app.platega.io") or "https://app.platega.io").rstrip("/")
 
+    # FreeKassa — приём СБП и карт через API (https://docs.freekassa.net/)
+    FREEKASSA_SHOP_ID = (os.getenv("FREEKASSA_SHOP_ID") or "").strip()
+    FREEKASSA_API_KEY = _get_env_clean("FREEKASSA_API_KEY") or ""
+    FREEKASSA_SECRET2 = _get_env_clean("FREEKASSA_SECRET2") or ""
+
+    def _get_client_ip(request: web.Request) -> str:
+        # Пытаемся взять реальный IP, если прокси передаёт заголовки
+        ip = request.headers.get("X-Real-IP") or request.headers.get("X-Forwarded-For", "")
+        if ip and "," in ip:
+            ip = ip.split(",")[0].strip()
+        if not ip:
+            ip = request.remote or ""
+        return ip
+
     # Fragment.com (сайт) — вызов fragment.com/api через cookies + hash (как в ezstar).
     _script_dir = os.path.dirname(os.path.abspath(__file__))
     _fragment_site_cfg = _read_json_file(os.path.join(_script_dir, "fragment_site_config.json"))
@@ -3247,6 +3288,23 @@ def setup_http_server():
         is_premium = purchase_type == "premium" or (purchase.get("months") is not None and purchase.get("months") != 0)
         order_id = (body.get("order_id") or body.get("orderId") or "").strip()
         transaction_id = (body.get("transaction_id") or body.get("transactionId") or "").strip()
+
+        # FreeKassa (СБП / карты): проверка по нашему order_id (MERCHANT_ORDER_ID)
+        if method in ("sbp", "card"):
+            order_id = (body.get("order_id") or body.get("orderId") or "").strip()
+            if not order_id:
+                return _json_response({"paid": False})
+            orders_fk = request.app.get("freekassa_orders") or {}
+            order_meta = None
+            if isinstance(orders_fk, dict):
+                order_meta = orders_fk.get(str(order_id))
+            if not order_meta:
+                order_meta = _load_freekassa_order_from_file(str(order_id))
+                if order_meta and isinstance(orders_fk, dict):
+                    orders_fk[str(order_id)] = order_meta
+            if order_meta and order_meta.get("delivered"):
+                return _json_response({"paid": True, "order_id": order_id})
+            return _json_response({"paid": False, "order_id": order_id})
 
         # Platega (карты / СБП): проверка по transaction_id
         if method == "platega":
@@ -4791,6 +4849,347 @@ def setup_http_server():
             logger.exception("Platega callback delivery error for %s: %s", tid, e)
         return web.Response(status=200, text="OK")
 
+    # FreeKassa: создание заказа (СБП / карты) и получение ссылки на оплату
+    async def freekassa_create_order_handler(request):
+        """POST /api/freekassa/create-order — создаёт заказ в FreeKassa и возвращает ссылку на оплату."""
+        if not FREEKASSA_SHOP_ID or not FREEKASSA_API_KEY:
+            return _json_response(
+                {"error": "not_configured", "message": "FREEKASSA_SHOP_ID и FREEKASSA_API_KEY не заданы."},
+                status=503,
+            )
+        try:
+            body = await request.json()
+        except Exception:
+            return _json_response({"error": "bad_request", "message": "Invalid JSON"}, status=400)
+
+        context = (body.get("context") or "").strip() or "purchase"
+        user_id = str(body.get("user_id") or body.get("userId") or "").strip() or "unknown"
+        purchase = body.get("purchase") or {}
+        method = (body.get("method") or "").strip().lower()
+        fk_i = int(body.get("i") or 0)
+
+        if context != "purchase":
+            return _json_response({"error": "bad_request", "message": "Только context=purchase поддерживается"}, status=400)
+
+        ptype = (purchase.get("type") or "").strip()
+        amount = 0.0
+        description = ""
+
+        if ptype == "stars":
+            try:
+                stars_amount = int(purchase.get("stars_amount") or purchase.get("starsAmount") or 0)
+            except (TypeError, ValueError):
+                stars_amount = 0
+            login = (purchase.get("login") or "").strip().lstrip("@")
+            if stars_amount < 50 or stars_amount > 1_000_000 or not login:
+                return _json_response({"error": "bad_request", "message": "Звёзды: 50..1000000 и получатель обязательны"}, status=400)
+            amount = round(stars_amount * STAR_PRICE_RUB, 2)
+            if amount < 1:
+                amount = 1.0
+            description = f"Звёзды Telegram — {stars_amount} шт. для @{login}"
+        elif ptype == "premium":
+            months = int(purchase.get("months") or 0)
+            if months not in PREMIUM_PRICES_RUB:
+                return _json_response({"error": "bad_request", "message": "Неверная длительность Premium"}, status=400)
+            amount = float(PREMIUM_PRICES_RUB[months])
+            description = f"Telegram Premium — {months} мес."
+        elif ptype == "steam":
+            try:
+                amount_steam = float(purchase.get("amount_steam") or purchase.get("amount") or 0)
+            except (TypeError, ValueError):
+                amount_steam = 0.0
+            login = (purchase.get("login") or "").strip()
+            if amount_steam < 50 or not login:
+                return _json_response({"error": "bad_request", "message": "Steam: минимум 50 ₽ и логин обязательны"}, status=400)
+            amount_rub = round(amount_steam * _get_steam_rate_rub(), 2)
+            if amount_rub <= 0 or amount_rub > 1_000_000:
+                return _json_response({"error": "bad_request", "message": "Неверная сумма Steam"}, status=400)
+            amount = float(amount_rub)
+            description = f"Пополнение Steam для {login} на {amount_steam:.0f} ₽ (к оплате {amount:.2f} ₽)"
+        else:
+            return _json_response({"error": "bad_request", "message": "Поддерживаются только звёзды, Premium и Steam"}, status=400)
+
+        if fk_i not in (36, 44, 43):
+            # 44 — СБП (QR), 36 — карты РФ, 43 — SberPay
+            fk_i = 44 if method == "sbp" else 36
+
+        # Наш order_id (MERCHANT_ORDER_ID / paymentId) — используем уже сгенерированный в мини‑аппе
+        payment_id = str(purchase.get("order_id") or "").strip()
+        if not payment_id:
+            return _json_response({"error": "bad_request", "message": "order_id обязателен в purchase.order_id"}, status=400)
+
+        # Email: реальный email клиента или Telegram ID в виде tgid@telegram.org
+        email = ""
+        try:
+            uid_int = int(str(user_id))
+            email = f"{uid_int}@telegram.org"
+        except Exception:
+            email = f"{user_id or 'client'}@telegram.org"
+
+        # IP: реальный IP клиента (если доступен) или IP сервера (но не 127.0.0.1)
+        ip = _get_client_ip(request)
+        if ip.startswith("127.") or ip in ("::1", ""):
+            ip = os.getenv("FREEKASSA_FALLBACK_IP", "8.8.8.8")
+
+        import time as _time
+        import hmac
+        import hashlib
+
+        try:
+            shop_id_int = int(FREEKASSA_SHOP_ID)
+        except Exception:
+            return _json_response({"error": "bad_config", "message": "FREEKASSA_SHOP_ID должен быть числом"}, status=503)
+
+        data = {
+            "shopId": shop_id_int,
+            "nonce": int((_time.time() + 10800) * 1000),
+            "paymentId": payment_id,
+            "i": fk_i,
+            "email": email,
+            "ip": ip,
+            "amount": float(amount),
+            "currency": "RUB",
+        }
+
+        # Подпись: sha256 по отсортированным значениям (через |) с использованием API ключа
+        items = sorted(data.items(), key=lambda kv: kv[0])
+        sign_source = "|".join(str(v) for _, v in items)
+        sign = hmac.new(FREEKASSA_API_KEY.encode("utf-8"), sign_source.encode("utf-8"), hashlib.sha256).hexdigest()
+        data["signature"] = sign
+
+        logger.info("FreeKassa create-order: paymentId=%s, i=%s, amount=%s", payment_id, fk_i, amount)
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post("https://api.fk.life/v1/orders/create", json=data) as resp:
+                    text = await resp.text()
+                    try:
+                        resp_data = json.loads(text) if text else {}
+                    except json.JSONDecodeError:
+                        logger.warning("FreeKassa create-order: response not JSON, status=%s, body=%s", resp.status, text[:300])
+                        return _json_response({"error": "freekassa_error", "message": f"Ответ не JSON: {text[:200]}"}, status=502)
+                    if resp.status != 200 or (resp_data.get("type") or "").lower() != "success":
+                        err = resp_data.get("message") or resp_data.get("error") or text[:300]
+                        logger.warning("FreeKassa create-order failed: status=%s, body=%s", resp.status, text[:500])
+                        return _json_response({"error": "freekassa_error", "message": str(err)}, status=502)
+                    order_id_fk = resp_data.get("orderId")
+                    location = resp_data.get("location") or ""
+                    if not location:
+                        # В некоторых реализациях URL может приходить как plain text
+                        if isinstance(resp_data, str) and resp_data.startswith("http"):
+                            location = resp_data
+                    if not location:
+                        return _json_response({"error": "freekassa_error", "message": "Не получена ссылка на оплату (location)"}, status=502)
+
+                    order_meta = {
+                        "context": context,
+                        "user_id": user_id,
+                        "amount_rub": float(amount),
+                        "purchase": dict(purchase),
+                        "fk_order_id": order_id_fk,
+                        "method": method,
+                        "i": fk_i,
+                        "created_at": _time.time(),
+                        "delivered": False,
+                    }
+                    try:
+                        orders_fk = request.app.get("freekassa_orders")
+                        if isinstance(orders_fk, dict):
+                            orders_fk[str(payment_id)] = order_meta
+                    except Exception:
+                        pass
+                    _save_freekassa_order_to_file(str(payment_id), order_meta)
+                    logger.info("FreeKassa order created: merchant_order_id=%s, fk_order_id=%s, amount=%s", payment_id, order_id_fk, amount)
+                    return _json_response(
+                        {
+                            "success": True,
+                            "order_id": payment_id,
+                            "fk_order_id": order_id_fk,
+                            "payment_url": location,
+                        }
+                    )
+        except aiohttp.ClientError as e:
+            logger.error("FreeKassa create-order network error: %s", e)
+            return _json_response({"error": "network_error", "message": str(e)}, status=502)
+        except Exception as e:
+            logger.exception("FreeKassa create-order error: %s", e)
+            return _json_response({"error": "internal_error", "message": str(e)}, status=500)
+
+    # FreeKassa: webhook-уведомление об оплате
+    async def freekassa_notify_handler(request):
+        """
+        URL оповещения FreeKassa.
+        Проверяем IP и SIGN, после чего выдаём товар и отвечаем 'YES'.
+        """
+        # Проверка IP сервера FreeKassa
+        allowed_ips = {
+            "168.119.157.136",
+            "168.119.60.227",
+            "178.154.197.79",
+            "51.250.54.238",
+        }
+        ip = _get_client_ip(request)
+        if ip not in allowed_ips:
+            logger.warning("FreeKassa notify: hacking attempt from IP %s", ip)
+            return web.Response(status=403, text="hacking attempt!")
+
+        if request.method == "POST":
+            try:
+                params = await request.post()
+            except Exception:
+                params = {}
+        else:
+            params = request.rel_url.query
+
+        merchant_id = (params.get("MERCHANT_ID") or "").strip()
+        amount_str = (params.get("AMOUNT") or "").strip()
+        merchant_order_id = (params.get("MERCHANT_ORDER_ID") or "").strip()
+        sign_recv = (params.get("SIGN") or "").strip().lower()
+
+        if not (merchant_id and amount_str and merchant_order_id and sign_recv):
+            logger.warning("FreeKassa notify: missing required params: %s", dict(params))
+            return web.Response(status=400, text="bad request")
+
+        if not FREEKASSA_SECRET2:
+            logger.warning("FreeKassa notify: FREEKASSA_SECRET2 not configured")
+            return web.Response(status=500, text="secret not configured")
+
+        import hashlib as _hashlib
+
+        sign_src = f"{merchant_id}:{amount_str}:{FREEKASSA_SECRET2}:{merchant_order_id}"
+        expected_sign = _hashlib.md5(sign_src.encode("utf-8")).hexdigest().lower()
+        if expected_sign != sign_recv:
+            logger.warning(
+                "FreeKassa notify: invalid SIGN for order %s (expected %s, got %s)",
+                merchant_order_id,
+                expected_sign,
+                sign_recv,
+            )
+            return web.Response(status=400, text="wrong sign")
+
+        order_meta = None
+        try:
+            orders_fk = request.app.get("freekassa_orders")
+            if isinstance(orders_fk, dict):
+                order_meta = orders_fk.get(str(merchant_order_id))
+            if not order_meta:
+                order_meta = _load_freekassa_order_from_file(str(merchant_order_id))
+                if order_meta and isinstance(orders_fk, dict):
+                    orders_fk[str(merchant_order_id)] = order_meta
+        except Exception as e:
+            logger.warning("FreeKassa notify: load order failed for %s: %s", merchant_order_id, e)
+
+        if not order_meta:
+            logger.warning("FreeKassa notify: order_meta not found for MERCHANT_ORDER_ID=%s", merchant_order_id)
+            return web.Response(status=200, text="YES")
+
+        if order_meta.get("delivered"):
+            return web.Response(status=200, text="YES")
+
+        purchase = order_meta.get("purchase") or {}
+        ptype = (purchase.get("type") or "").strip().lower()
+        user_id = str(order_meta.get("user_id") or "unknown")
+        try:
+            amount_rub = float(order_meta.get("amount_rub") or amount_str or 0.0)
+        except (TypeError, ValueError):
+            amount_rub = 0.0
+
+        try:
+            if ptype == "stars":
+                recipient = (purchase.get("login") or "").strip().lstrip("@")
+                stars_amount = int(purchase.get("stars_amount") or 0)
+                if recipient and stars_amount >= 50 and TON_WALLET_ENABLED:
+                    _, recipient_address = await _fragment_get_recipient_address(recipient)
+                    req_id = await _fragment_init_buy(recipient_address, stars_amount)
+                    tx_address, amount_nanoton, payload_b64 = await _fragment_get_buy_link(req_id)
+                    payload_decoded = _fragment_encoded(payload_b64)
+                    tx_hash, send_err = await _ton_wallet_send_safe(tx_address, amount_nanoton, payload_decoded)
+                    if tx_hash:
+                        order_meta["delivered"] = True
+                        try:
+                            orders_fk = request.app.get("freekassa_orders")
+                            if isinstance(orders_fk, dict):
+                                orders_fk[str(merchant_order_id)] = order_meta
+                        except Exception:
+                            pass
+                        _save_freekassa_order_to_file(str(merchant_order_id), order_meta)
+                        import db as _db
+
+                        order_id_custom = str(purchase.get("order_id") or "").strip() or None
+                        if _db.is_enabled():
+                            await _db.user_upsert(user_id, purchase.get("username") or "", purchase.get("first_name") or "")
+                            await _db.purchase_add(user_id, amount_rub, stars_amount, "stars", f"{stars_amount} звёзд", order_id_custom)
+                        await _apply_referral_earnings_for_purchase(
+                            user_id=user_id,
+                            amount_rub=amount_rub,
+                            username=purchase.get("username") or "",
+                            first_name=purchase.get("first_name") or "",
+                        )
+                        logger.info("FreeKassa notify: stars delivered, MERCHANT_ORDER_ID=%s", merchant_order_id)
+            elif ptype == "premium":
+                order_meta["delivered"] = True
+                try:
+                    orders_fk = request.app.get("freekassa_orders")
+                    if isinstance(orders_fk, dict):
+                        orders_fk[str(merchant_order_id)] = order_meta
+                except Exception:
+                    pass
+                _save_freekassa_order_to_file(str(merchant_order_id), order_meta)
+                await _apply_referral_earnings_for_purchase(
+                    user_id=user_id,
+                    amount_rub=amount_rub,
+                    username=purchase.get("username") or "",
+                    first_name=purchase.get("first_name") or "",
+                )
+                logger.info("FreeKassa notify: premium recorded, MERCHANT_ORDER_ID=%s", merchant_order_id)
+            elif ptype == "steam":
+                account = (purchase.get("login") or "").strip()
+                amount_steam = purchase.get("amount_steam") or purchase.get("amount") or amount_rub
+                try:
+                    amount_steam = float(amount_steam)
+                except (TypeError, ValueError):
+                    amount_steam = amount_rub
+                steam_notify_chat_id = int(os.getenv("STEAM_NOTIFY_CHAT_ID", "0") or "0")
+                notify_lines = [
+                    "💻 Новый заказ Steam (FreeKassa)",
+                    "",
+                    f"👤 Аккаунт Steam: <code>{account or '—'}</code>",
+                    f"💰 Сумма на кошелёк Steam: <b>{amount_steam:.0f} ₽</b>",
+                    f"💵 Оплачено: <b>{amount_rub:.2f} ₽</b>",
+                    f"🧾 FreeKassa MERCHANT_ORDER_ID: <code>{merchant_order_id}</code>",
+                ]
+                funpay_url = os.getenv("FUNPAY_STEAM_URL", "").strip()
+                if funpay_url:
+                    notify_lines.append("")
+                    notify_lines.append(f"🛒 Лот FunPay: {funpay_url}")
+                notify_text = "\n".join(notify_lines)
+                if steam_notify_chat_id:
+                    await bot.send_message(
+                        chat_id=steam_notify_chat_id,
+                        text=notify_text,
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                    )
+                await _apply_referral_earnings_for_purchase(
+                    user_id=user_id,
+                    amount_rub=amount_rub,
+                    username=purchase.get("username") or "",
+                    first_name=purchase.get("first_name") or "",
+                )
+                order_meta["delivered"] = True
+                try:
+                    orders_fk = request.app.get("freekassa_orders")
+                    if isinstance(orders_fk, dict):
+                        orders_fk[str(merchant_order_id)] = order_meta
+                except Exception:
+                    pass
+                _save_freekassa_order_to_file(str(merchant_order_id), order_meta)
+                logger.info("FreeKassa notify: steam order recorded, MERCHANT_ORDER_ID=%s", merchant_order_id)
+        except Exception as e:
+            logger.exception("FreeKassa notify error for MERCHANT_ORDER_ID=%s: %s", merchant_order_id, e)
+
+        return web.Response(status=200, text="YES")
+
     app.router.add_post("/api/cryptobot/create-invoice", cryptobot_create_invoice_handler)
     app.router.add_route("OPTIONS", "/api/cryptobot/create-invoice", lambda r: Response(status=204, headers=_cors_headers()))
     app.router.add_post("/api/cryptobot/check-invoice", cryptobot_check_invoice_handler)
@@ -4805,6 +5204,12 @@ def setup_http_server():
     app.router.add_post("/api/platega/create-transaction", platega_create_transaction_handler)
     # Callback Platega: один маршрут на любой метод (как webhook CryptoBot), чтобы POST точно находился
     app.router.add_route("*", "/api/platega/callback", platega_callback_handler)
+
+    # FreeKassa: API и вебхук
+    app.router.add_post("/api/freekassa/create-order", freekassa_create_order_handler)
+    app.router.add_route("OPTIONS", "/api/freekassa/create-order", lambda r: Response(status=204, headers=_cors_headers()))
+    app.router.add_get("/api/freekassa/notify", freekassa_notify_handler)
+    app.router.add_post("/api/freekassa/notify", freekassa_notify_handler)
 
     # Health-check для Railway: чтобы не было 404 на /api/health
     async def health_handler(request):
