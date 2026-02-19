@@ -5146,30 +5146,43 @@ def setup_http_server():
         URL оповещения FreeKassa.
         Проверяем IP и SIGN, после чего выдаём товар и отвечаем 'YES'.
         """
-        # Проверка IP сервера FreeKassa
+        # Проверка IP сервера FreeKassa (добавить свои через FREEKASSA_ALLOWED_IPS: через запятую)
         allowed_ips = {
             "168.119.157.136",
             "168.119.60.227",
             "178.154.197.79",
             "51.250.54.238",
         }
+        extra_ips = (os.getenv("FREEKASSA_ALLOWED_IPS") or "").strip()
+        if extra_ips:
+            for x in extra_ips.replace(" ", "").split(","):
+                if x:
+                    allowed_ips.add(x.strip())
+        skip_ip = (os.getenv("FREEKASSA_SKIP_IP_CHECK") or "").strip().lower() in ("1", "true", "yes")
         ip = _get_client_ip(request)
-        if ip not in allowed_ips:
-            logger.warning("FreeKassa notify: hacking attempt from IP %s", ip)
+        if not skip_ip and ip not in allowed_ips:
+            logger.warning("FreeKassa notify: IP %s not in allowed list (add via FREEKASSA_ALLOWED_IPS or FREEKASSA_SKIP_IP_CHECK=1)", ip)
             return web.Response(status=403, text="hacking attempt!")
 
         if request.method == "POST":
             try:
-                params = await request.post()
+                content_type = (request.headers.get("Content-Type") or "").lower()
+                if "application/json" in content_type:
+                    params = await request.json()
+                    if not isinstance(params, dict):
+                        params = {}
+                else:
+                    post_data = await request.post()
+                    params = dict(post_data) if post_data else {}
             except Exception:
                 params = {}
         else:
-            params = request.rel_url.query
+            params = dict(request.rel_url.query)
 
-        merchant_id = (params.get("MERCHANT_ID") or "").strip()
-        amount_str = (params.get("AMOUNT") or "").strip()
-        merchant_order_id = (params.get("MERCHANT_ORDER_ID") or "").strip()
-        sign_recv = (params.get("SIGN") or "").strip().lower()
+        merchant_id = str(params.get("MERCHANT_ID") or params.get("merchantId") or params.get("merchant_id") or "").strip()
+        amount_str = str(params.get("AMOUNT") or params.get("amount") or params.get("sum") or "").strip()
+        merchant_order_id = str(params.get("MERCHANT_ORDER_ID") or params.get("merchantOrderId") or params.get("merchant_order_id") or params.get("paymentId") or params.get("payment_id") or "").strip()
+        sign_recv = str(params.get("SIGN") or params.get("sign") or params.get("signature") or "").strip().lower()
 
         if not (merchant_id and amount_str and merchant_order_id and sign_recv):
             logger.warning("FreeKassa notify: missing required params: %s", dict(params))
@@ -5212,12 +5225,11 @@ def setup_http_server():
         if order_meta.get("delivered"):
             logger.info("FreeKassa notify: order already delivered, MERCHANT_ORDER_ID=%s", merchant_order_id)
             return web.Response(status=200, text="YES")
-        
-        logger.info("FreeKassa notify: processing order MERCHANT_ORDER_ID=%s, purchase_type=%s, user_id=%s", merchant_order_id, purchase.get("type"), user_id)
 
         purchase = order_meta.get("purchase") or {}
         ptype = (purchase.get("type") or "").strip().lower()
         user_id = str(order_meta.get("user_id") or "unknown")
+        logger.info("FreeKassa notify: processing order MERCHANT_ORDER_ID=%s, purchase_type=%s, user_id=%s", merchant_order_id, ptype, user_id)
         try:
             amount_rub = float(order_meta.get("amount_rub") or amount_str or 0.0)
         except (TypeError, ValueError):
@@ -5233,6 +5245,11 @@ def setup_http_server():
                     tx_address, amount_nanoton, payload_b64 = await _fragment_get_buy_link(req_id)
                     payload_decoded = _fragment_encoded(payload_b64)
                     tx_hash, send_err = await _ton_wallet_send_safe(tx_address, amount_nanoton, payload_decoded)
+                    if not tx_hash:
+                        logger.error(
+                            "FreeKassa notify: stars delivery failed, MERCHANT_ORDER_ID=%s, recipient=%s, stars=%s, error=%s",
+                            merchant_order_id, recipient, stars_amount, send_err or "unknown"
+                        )
                     if tx_hash:
                         order_meta["delivered"] = True
                         try:
