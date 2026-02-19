@@ -914,16 +914,16 @@ def is_admin(user_id: int) -> bool:
     return db.is_admin(user_id)
 
 def get_main_menu(language: str = 'ru'):
-    """Главное меню (только русская раскладка)"""
+    """Главное меню — синие кнопки (primary) для основных действий, красная (danger) для помощи"""
     keyboard = [
         [
-            InlineKeyboardButton(text="🚀 Открыть приложение", web_app=WebAppInfo(url=WEB_APP_URL)),
+            InlineKeyboardButton(text="🚀 Открыть приложение", web_app=WebAppInfo(url=WEB_APP_URL), style="primary"),
         ],
         [
-            InlineKeyboardButton(text="📰 Подписаться на канал", url="https://t.me/JetStoreApp"),
+            InlineKeyboardButton(text="📰 Подписаться на канал", url="https://t.me/JetStoreApp", style="primary"),
         ],
         [
-            InlineKeyboardButton(text="❓ Помощь", callback_data="help_info"),
+            InlineKeyboardButton(text="? Помощь", callback_data="help_info", style="danger"),
         ]
     ]
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
@@ -932,20 +932,20 @@ def get_about_menu(language: str = 'ru'):
     """Меню 'О нас' (только русский текст)"""
     keyboard = [
         [
-            InlineKeyboardButton(text="📞 Помощь", url="https://t.me/L3ZTADM"),
-            InlineKeyboardButton(text="📢 Наш канал", url="https://t.me/JetStoreApp")
+            InlineKeyboardButton(text="📞 Помощь", url="https://t.me/L3ZTADM", style="primary"),
+            InlineKeyboardButton(text="📢 Наш канал", url="https://t.me/JetStoreApp", style="primary")
         ],
         [
             InlineKeyboardButton(text="📄 Договор оферты",
-                                url="https://telegra.ph/Dogovor-Oferty-02-11-4"),
+                                url="https://telegra.ph/Dogovor-Oferty-02-11-4", style="primary"),
         ],
         [
             InlineKeyboardButton(text="📜 Пользовательское соглашение",
-                                url="https://telegra.ph/Polzovatelskoe-soglashenie-02-11-33"),
+                                url="https://telegra.ph/Polzovatelskoe-soglashenie-02-11-33", style="primary"),
         ],
         [
             InlineKeyboardButton(text="🔒 Политика конфиденциальности",
-                                url="https://telegra.ph/Politika-konfidecialnosti-02-11"),
+                                url="https://telegra.ph/Politika-konfidecialnosti-02-11", style="primary"),
         ],
         [
             InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")
@@ -3098,9 +3098,6 @@ def setup_http_server():
     FREEKASSA_SHOP_ID = (os.getenv("FREEKASSA_SHOP_ID") or "").strip()
     FREEKASSA_API_KEY = _get_env_clean("FREEKASSA_API_KEY") or ""
     FREEKASSA_SECRET2 = _get_env_clean("FREEKASSA_SECRET2") or ""
-    # Комиссия FreeKassa (переложенная на пользователя): СБП % и Карты %
-    FREEKASSA_SBP_PERCENT = float(os.getenv("FREEKASSA_SBP_PERCENT", "7") or "7")
-    FREEKASSA_CARDS_PERCENT = float(os.getenv("FREEKASSA_CARDS_PERCENT", "8") or "8")
 
     def _get_client_ip(request: web.Request) -> str:
         # Пытаемся взять реальный IP, если прокси передаёт заголовки
@@ -5012,15 +5009,7 @@ def setup_http_server():
         else:
             return _json_response({"error": "bad_request", "message": "Поддерживаются только звёзды, Premium и Steam"}, status=400)
 
-        # Применяем комиссию FreeKassa (переложенную на пользователя)
-        commission_pct = 0.0
-        if method == "sbp":
-            commission_pct = FREEKASSA_SBP_PERCENT
-        elif method == "card":
-            commission_pct = FREEKASSA_CARDS_PERCENT
-        if commission_pct and commission_pct != 0.0:
-            amount = round(amount * (1 + commission_pct / 100.0), 2)
-
+        # FreeKassa сама добавляет комиссию (СБП ~5%, карты ~6%) — в amount передаём чистую сумму без надбавки
         if fk_i not in (36, 44, 43):
             # 44 — СБП (QR), 36 — карты РФ, 43 — SberPay
             fk_i = 44 if method == "sbp" else 36
