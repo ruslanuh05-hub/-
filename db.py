@@ -104,7 +104,15 @@ async def _ensure_schema():
             )
         """)
         logger.info("PostgreSQL: ensured table 'rating_prefs'")
-    logger.info("Схема PostgreSQL проверена (users, purchases, referrals, rating_prefs)")
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS app_rates (
+                key TEXT PRIMARY KEY,
+                value NUMERIC(12,4) NOT NULL,
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        logger.info("PostgreSQL: ensured table 'app_rates'")
+    logger.info("Схема PostgreSQL проверена (users, purchases, referrals, rating_prefs, app_rates)")
 
 
 # --- Referrals ---
@@ -299,3 +307,25 @@ async def rating_set(user_id: str, show: bool):
             VALUES ($1, $2)
             ON CONFLICT (user_id) DO UPDATE SET show_in_rating = $2, updated_at = NOW()
         """, user_id, show)
+
+
+# --- App rates (курсы звёзд, Steam, Premium для FreeKassa и др.) ---
+
+async def rates_get() -> dict:
+    """Получить все курсы из БД. key -> value (float)."""
+    if not _db_enabled:
+        return {}
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch("SELECT key, value FROM app_rates")
+    return {r["key"]: float(r["value"]) for r in rows if r["value"] is not None}
+
+
+async def rates_set(key: str, value: float):
+    """Установить курс. key: star_price_rub, star_buy_rate_rub, steam_rate_rub, premium_3, premium_6, premium_12."""
+    if not _db_enabled:
+        return
+    async with _pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO app_rates (key, value) VALUES ($1, $2)
+            ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()
+        """, key, value)

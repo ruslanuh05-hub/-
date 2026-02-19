@@ -2527,6 +2527,12 @@ def setup_http_server():
                 return _json_response({"error": "bad_request", "message": "Курс должен быть от 0.01 до 100"}, status=400)
             _steam_rate_rub_override = rate
             _save_app_rates_to_file()
+            try:
+                import db as _db_rates
+                if _db_rates.is_enabled():
+                    await _db_rates.rates_set("steam_rate_rub", rate)
+            except Exception as e:
+                logger.debug("rates_set steam_rate_rub: %s", e)
             return _json_response({"steam_rate_rub": _steam_rate_rub_override})
         try:
             rate = _get_steam_rate_rub()
@@ -2555,6 +2561,12 @@ def setup_http_server():
                     if 0.01 <= r <= 1000:
                         _star_price_rub_override = r
                         updated = True
+                        try:
+                            import db as _db_rates
+                            if _db_rates.is_enabled():
+                                await _db_rates.rates_set("star_price_rub", r)
+                        except Exception as e:
+                            logger.debug("rates_set star_price_rub: %s", e)
                 except (TypeError, ValueError):
                     pass
             v = body.get("star_buy_rate_rub")
@@ -2564,6 +2576,12 @@ def setup_http_server():
                     if 0.01 <= r <= 100:
                         _star_buy_rate_rub_override = r
                         updated = True
+                        try:
+                            import db as _db_rates
+                            if _db_rates.is_enabled():
+                                await _db_rates.rates_set("star_buy_rate_rub", r)
+                        except Exception as e:
+                            logger.debug("rates_set star_buy_rate_rub: %s", e)
                 except (TypeError, ValueError):
                     pass
             if updated:
@@ -2584,6 +2602,49 @@ def setup_http_server():
     app.router.add_get('/api/star-rate', star_rate_handler)
     app.router.add_post('/api/star-rate', star_rate_handler)
     app.router.add_route('OPTIONS', '/api/star-rate', lambda r: Response(status=204, headers=_cors_headers()))
+
+    async def premium_prices_handler(request):
+        """GET/POST /api/premium-prices — цены Premium (3, 6, 12 мес.) для FreeKassa и др. POST: { premium_3?, premium_6?, premium_12? } или { 3?, 6?, 12? }."""
+        if request.method == "POST":
+            try:
+                body = await request.json()
+            except Exception:
+                return _json_response({"error": "bad_request", "message": "Invalid JSON"}, status=400)
+            for key_name, num in [("premium_3", 3), ("premium_6", 6), ("premium_12", 12)]:
+                v = body.get(key_name) or body.get(str(num))
+                if v is not None and v != "":
+                    try:
+                        r = float(v)
+                        if 1 <= r <= 100000:
+                            try:
+                                import db as _db_prem
+                                if _db_prem.is_enabled():
+                                    await _db_prem.rates_set(key_name, r)
+                            except Exception as e:
+                                logger.debug("rates_set %s: %s", key_name, e)
+                    except (TypeError, ValueError):
+                        pass
+            return _json_response({"success": True})
+        try:
+            import db as _db_prem
+            if _db_prem.is_enabled():
+                rates = await _db_prem.rates_get()
+                return _json_response({
+                    "premium_3": float(rates.get("premium_3") or 0) or 983,
+                    "premium_6": float(rates.get("premium_6") or 0) or 1311,
+                    "premium_12": float(rates.get("premium_12") or 0) or 2377,
+                })
+        except Exception as e:
+            logger.debug("premium_prices rates_get: %s", e)
+        return _json_response({
+            "premium_3": PREMIUM_PRICES_RUB.get(3, 983),
+            "premium_6": PREMIUM_PRICES_RUB.get(6, 1311),
+            "premium_12": PREMIUM_PRICES_RUB.get(12, 2377),
+        })
+
+    app.router.add_get('/api/premium-prices', premium_prices_handler)
+    app.router.add_post('/api/premium-prices', premium_prices_handler)
+    app.router.add_route('OPTIONS', '/api/premium-prices', lambda r: Response(status=204, headers=_cors_headers()))
 
     # Комиссия Platega: СБП % и Карты % (GET — текущие, POST — установить из админки)
     async def platega_commission_handler(request):
@@ -4218,7 +4279,6 @@ def setup_http_server():
         - context='purchase' + purchase (type, stars_amount, months, login) + user_id
         - context='deposit'  + amount (RUB) + user_id
         """
-        _load_app_rates_from_file()
         if not CRYPTO_PAY_TOKEN:
             return _json_response(
                 {
@@ -4243,12 +4303,24 @@ def setup_http_server():
 
         # ----------- Покупка (звёзды / премиум / Steam) -----------
         # ВАЖНО: клиент НЕ задаёт цену и payload. Только type + минимальные данные.
-        # Цена считается на бэке из stars_amount * _get_star_price_rub() и т.д.
+        # Цена считается на бэке из stars_amount * курс (из БД или файла)
         if context == "purchase":
             purchase = body.get("purchase") or {}
             ptype = (purchase.get("type") or "").strip()
             if not _validate_user_id(user_id):
                 return _json_response({"error": "bad_request", "message": "Некорректный user_id"}, status=400)
+            rates_db = {}
+            try:
+                import db as _db_pg
+                if _db_pg.is_enabled():
+                    rates_db = await _db_pg.rates_get()
+            except Exception as e:
+                logger.debug("rates_get: %s", e)
+            _star = float(rates_db.get("star_price_rub") or 0) or _get_star_price_rub()
+            _steam = float(rates_db.get("steam_rate_rub") or 0) or _get_steam_rate_rub()
+            _premium = {3: float(rates_db.get("premium_3") or 0) or PREMIUM_PRICES_RUB.get(3, 983),
+                        6: float(rates_db.get("premium_6") or 0) or PREMIUM_PRICES_RUB.get(6, 1311),
+                        12: float(rates_db.get("premium_12") or 0) or PREMIUM_PRICES_RUB.get(12, 2377)}
             # Игнорируем amount, price, payload от клиента — всё считаем на бэке
             if ptype == "stars" and (purchase.get("amount") is not None or purchase.get("price") is not None):
                 return _json_response(
@@ -4267,7 +4339,7 @@ def setup_http_server():
                 stars_err = _validate_stars_amount(stars_amount)
                 if stars_err:
                     return _json_response({"error": "bad_request", "message": stars_err}, status=400)
-                amount = round(stars_amount * _get_star_price_rub(), 2)
+                amount = round(stars_amount * _star, 2)
                 if amount < 1:
                     amount = 1.0
                 description = f"Звёзды Telegram — {stars_amount} шт. для @{login_val}"
@@ -4293,11 +4365,11 @@ def setup_http_server():
                     return _json_response(
                         {"error": "bad_request", "message": "Premium: допустимые периоды 3, 6 или 12 мес."}, status=400
                     )
-                if months not in PREMIUM_PRICES_RUB:
+                if months not in _premium:
                     return _json_response(
                         {"error": "bad_request", "message": "Неверная длительность Premium"}, status=400
                     )
-                amount = float(PREMIUM_PRICES_RUB[months])
+                amount = float(_premium[months])
                 description = f"Telegram Premium — {months} мес."
                 payload_data = json.dumps(
                     {
@@ -4322,7 +4394,7 @@ def setup_http_server():
                 steam_err = _validate_steam_amount(amount_steam)
                 if steam_err:
                     return _json_response({"error": "bad_request", "message": steam_err}, status=400)
-                amount_rub = round(amount_steam * _get_steam_rate_rub(), 2)
+                amount_rub = round(amount_steam * _steam, 2)
                 rub_err = _validate_amount_rub(amount_rub)
                 if rub_err:
                     return _json_response({"error": "bad_request", "message": rub_err}, status=400)
@@ -4827,7 +4899,6 @@ def setup_http_server():
     # Platega.io: создание транзакции (карты / СБП)
     async def platega_create_transaction_handler(request):
         """POST /api/platega/create-transaction — создаёт транзакцию в Platega, возвращает redirect URL."""
-        _load_app_rates_from_file()
         if not PLATEGA_MERCHANT_ID or not PLATEGA_SECRET:
             return _json_response(
                 {"error": "not_configured", "message": "PLATEGA_MERCHANT_ID и PLATEGA_SECRET не заданы."},
@@ -4847,6 +4918,18 @@ def setup_http_server():
         ptype = (purchase.get("type") or "").strip()
         amount = 0.0
         description = ""
+        rates_db = {}
+        try:
+            import db as _db_pg
+            if _db_pg.is_enabled():
+                rates_db = await _db_pg.rates_get()
+        except Exception as e:
+            logger.debug("rates_get: %s", e)
+        _star = float(rates_db.get("star_price_rub") or 0) or _get_star_price_rub()
+        _steam = float(rates_db.get("steam_rate_rub") or 0) or _get_steam_rate_rub()
+        _premium = {3: float(rates_db.get("premium_3") or 0) or PREMIUM_PRICES_RUB.get(3, 983),
+                    6: float(rates_db.get("premium_6") or 0) or PREMIUM_PRICES_RUB.get(6, 1311),
+                    12: float(rates_db.get("premium_12") or 0) or PREMIUM_PRICES_RUB.get(12, 2377)}
         if ptype == "stars":
             try:
                 stars_amount = int(purchase.get("stars_amount") or purchase.get("starsAmount") or 0)
@@ -4858,7 +4941,7 @@ def setup_http_server():
             stars_err = _validate_stars_amount(stars_amount)
             if stars_err:
                 return _json_response({"error": "bad_request", "message": stars_err}, status=400)
-            amount = round(stars_amount * _get_star_price_rub(), 2)
+            amount = round(stars_amount * _star, 2)
             if amount < 1:
                 amount = 1.0
             purchase["login"] = login_val
@@ -4867,9 +4950,9 @@ def setup_http_server():
             months = int(purchase.get("months") or 0)
             if months not in VALIDATION_LIMITS["premium_months"]:
                 return _json_response({"error": "bad_request", "message": "Premium: допустимые периоды 3, 6 или 12 мес."}, status=400)
-            if months not in PREMIUM_PRICES_RUB:
+            if months not in _premium:
                 return _json_response({"error": "bad_request", "message": "Неверная длительность Premium"}, status=400)
-            amount = float(PREMIUM_PRICES_RUB[months])
+            amount = float(_premium[months])
             description = f"Telegram Premium — {months} мес."
         elif ptype == "steam":
             try:
@@ -4882,7 +4965,7 @@ def setup_http_server():
             steam_err = _validate_steam_amount(amount_steam)
             if steam_err:
                 return _json_response({"error": "bad_request", "message": steam_err}, status=400)
-            amount_rub = round(amount_steam * _get_steam_rate_rub(), 2)
+            amount_rub = round(amount_steam * _steam, 2)
             rub_err = _validate_amount_rub(amount_rub)
             if rub_err:
                 return _json_response({"error": "bad_request", "message": rub_err}, status=400)
@@ -5111,7 +5194,6 @@ def setup_http_server():
     # FreeKassa: создание заказа (СБП / карты) и получение ссылки на оплату
     async def freekassa_create_order_handler(request):
         """POST /api/freekassa/create-order — создаёт заказ в FreeKassa и возвращает ссылку на оплату."""
-        _load_app_rates_from_file()  # перезагружаем курсы из файла (админка могла обновить)
         if not FREEKASSA_SHOP_ID or not FREEKASSA_API_KEY:
             return _json_response(
                 {"error": "not_configured", "message": "FREEKASSA_SHOP_ID и FREEKASSA_API_KEY не заданы."},
@@ -5142,6 +5224,20 @@ def setup_http_server():
         amount = 0.0
         description = ""
 
+        # Курсы из БД (если PostgreSQL подключён) или из файла/env
+        rates_db = {}
+        try:
+            import db as _db_pg
+            if _db_pg.is_enabled():
+                rates_db = await _db_pg.rates_get()
+        except Exception as e:
+            logger.debug("rates_get: %s", e)
+        _star = float(rates_db.get("star_price_rub") or 0) or _get_star_price_rub()
+        _steam = float(rates_db.get("steam_rate_rub") or 0) or _get_steam_rate_rub()
+        _premium = {3: float(rates_db.get("premium_3") or 0) or PREMIUM_PRICES_RUB.get(3, 983),
+                    6: float(rates_db.get("premium_6") or 0) or PREMIUM_PRICES_RUB.get(6, 1311),
+                    12: float(rates_db.get("premium_12") or 0) or PREMIUM_PRICES_RUB.get(12, 2377)}
+
         if ptype == "stars":
             try:
                 stars_amount = int(purchase.get("stars_amount") or purchase.get("starsAmount") or 0)
@@ -5153,7 +5249,7 @@ def setup_http_server():
             stars_err = _validate_stars_amount(stars_amount)
             if stars_err:
                 return _json_response({"error": "bad_request", "message": stars_err}, status=400)
-            amount = round(stars_amount * _get_star_price_rub(), 2)
+            amount = round(stars_amount * _star, 2)
             if amount < 1:
                 amount = 1.0
             purchase["login"] = login_val
@@ -5162,9 +5258,9 @@ def setup_http_server():
             months = int(purchase.get("months") or 0)
             if months not in VALIDATION_LIMITS["premium_months"]:
                 return _json_response({"error": "bad_request", "message": "Premium: допустимые периоды 3, 6 или 12 мес."}, status=400)
-            if months not in PREMIUM_PRICES_RUB:
+            if months not in _premium:
                 return _json_response({"error": "bad_request", "message": "Неверная длительность Premium"}, status=400)
-            amount = float(PREMIUM_PRICES_RUB[months])
+            amount = float(_premium[months])
             description = f"Telegram Premium — {months} мес."
         elif ptype == "steam":
             try:
@@ -5177,7 +5273,7 @@ def setup_http_server():
             steam_err = _validate_steam_amount(amount_steam)
             if steam_err:
                 return _json_response({"error": "bad_request", "message": steam_err}, status=400)
-            amount_rub = round(amount_steam * _get_steam_rate_rub(), 2)
+            amount_rub = round(amount_steam * _steam, 2)
             rub_err = _validate_amount_rub(amount_rub)
             if rub_err:
                 return _json_response({"error": "bad_request", "message": rub_err}, status=400)
