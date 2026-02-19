@@ -5354,24 +5354,39 @@ def setup_http_server():
         except Exception:
             return _json_response({"error": "bad_config", "message": "FREEKASSA_SHOP_ID должен быть числом"}, status=503)
 
+        # Формируем данные для запроса
+        # ВАЖНО: amount должен быть числом с десятичными знаками для RUB, i должно быть числом
+        amount_value = round(float(amount), 2)
+        if amount_value < 0.01:
+            amount_value = 0.01
+        nonce_value = int((_time.time() + 10800) * 1000)
+        
         data = {
             "shopId": shop_id_int,
-            "nonce": int((_time.time() + 10800) * 1000),
+            "nonce": nonce_value,
             "paymentId": payment_id,
-            "i": fk_i,
+            "i": int(fk_i),
             "email": email,
             "ip": ip,
-            "amount": float(amount),
+            "amount": amount_value,
             "currency": "RUB",
         }
+        
+        # Проверяем, что API ключ не пустой
+        if not FREEKASSA_API_KEY or len(FREEKASSA_API_KEY.strip()) == 0:
+            logger.error("FreeKassa API_KEY is empty!")
+            return _json_response({"error": "bad_config", "message": "FREEKASSA_API_KEY не задан"}, status=503)
 
-        # Подпись: sha256 по отсортированным значениям (через |) с использованием API ключа
+        # Подпись: HMAC-SHA256 от отсортированных значений (ключи по алфавиту, значения через |)
+        # Порядок параметров: amount|currency|email|i|ip|nonce|paymentId|shopId
         items = sorted(data.items(), key=lambda kv: kv[0])
         sign_source = "|".join(str(v) for _, v in items)
         sign = hmac.new(FREEKASSA_API_KEY.encode("utf-8"), sign_source.encode("utf-8"), hashlib.sha256).hexdigest()
         data["signature"] = sign
 
-        logger.info("FreeKassa create-order: paymentId=%s, i=%s, amount=%s", payment_id, fk_i, amount)
+        logger.info("FreeKassa create-order: paymentId=%s, i=%s, amount=%s", payment_id, fk_i, amount_value)
+        logger.info("FreeKassa sign_source: %s", sign_source)
+        logger.info("FreeKassa signature: %s", sign[:16] + "..." if len(sign) > 16 else sign)
 
         try:
             async with aiohttp.ClientSession() as session:
