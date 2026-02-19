@@ -4218,6 +4218,7 @@ def setup_http_server():
         - context='purchase' + purchase (type, stars_amount, months, login) + user_id
         - context='deposit'  + amount (RUB) + user_id
         """
+        _load_app_rates_from_file()
         if not CRYPTO_PAY_TOKEN:
             return _json_response(
                 {
@@ -4826,6 +4827,7 @@ def setup_http_server():
     # Platega.io: создание транзакции (карты / СБП)
     async def platega_create_transaction_handler(request):
         """POST /api/platega/create-transaction — создаёт транзакцию в Platega, возвращает redirect URL."""
+        _load_app_rates_from_file()
         if not PLATEGA_MERCHANT_ID or not PLATEGA_SECRET:
             return _json_response(
                 {"error": "not_configured", "message": "PLATEGA_MERCHANT_ID и PLATEGA_SECRET не заданы."},
@@ -5109,6 +5111,7 @@ def setup_http_server():
     # FreeKassa: создание заказа (СБП / карты) и получение ссылки на оплату
     async def freekassa_create_order_handler(request):
         """POST /api/freekassa/create-order — создаёт заказ в FreeKassa и возвращает ссылку на оплату."""
+        _load_app_rates_from_file()  # перезагружаем курсы из файла (админка могла обновить)
         if not FREEKASSA_SHOP_ID or not FREEKASSA_API_KEY:
             return _json_response(
                 {"error": "not_configured", "message": "FREEKASSA_SHOP_ID и FREEKASSA_API_KEY не заданы."},
