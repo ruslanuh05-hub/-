@@ -70,23 +70,42 @@ SELL_STARS_NOTIFY_CHAT_ID = int(os.getenv("SELL_STARS_NOTIFY_CHAT_ID", "0") or "
 TON_NOTIFY_CHAT_ID = int(os.getenv("TON_NOTIFY_CHAT_ID", "0") or "0")
 IDEAS_CHAT_ID = int(os.getenv("IDEAS_CHAT_ID", "0") or "0")
 
-# Курс выплаты за 1 звезду (RUB), используем тот же, что в мини-аппе
-STAR_BUY_RATE_RUB = float(os.getenv("STAR_BUY_RATE_RUB", "0.65") or "0.65")
-# Цена покупки 1 звезды (RUB) — для конвертации звёзд в рубли при оплате через CryptoBot
-STAR_PRICE_RUB = float(os.getenv("STAR_PRICE_RUB", "1.37") or "1.37")
+# Курсы звёзд и Steam: из env по умолчанию, из админки (файл + API) — переопределяют
+STAR_BUY_RATE_RUB_DEFAULT = float(os.getenv("STAR_BUY_RATE_RUB", "0.65") or "0.65")
+STAR_PRICE_RUB_DEFAULT = float(os.getenv("STAR_PRICE_RUB", "1.37") or "1.37")
+STEAM_RATE_RUB_DEFAULT = float(os.getenv("STEAM_RATE_RUB", "1.06") or "1.06")
+
+_star_price_rub_override: Optional[float] = None
+_star_buy_rate_rub_override: Optional[float] = None
+_steam_rate_rub_override: Optional[float] = None
+
+def _get_star_price_rub() -> float:
+    if _star_price_rub_override is not None and _star_price_rub_override > 0:
+        return _star_price_rub_override
+    return STAR_PRICE_RUB_DEFAULT
+
+def _get_star_buy_rate_rub() -> float:
+    if _star_buy_rate_rub_override is not None and _star_buy_rate_rub_override > 0:
+        return _star_buy_rate_rub_override
+    return STAR_BUY_RATE_RUB_DEFAULT
+
+def _get_steam_rate_rub() -> float:
+    if _steam_rate_rub_override is not None and _steam_rate_rub_override > 0:
+        return _steam_rate_rub_override
+    return STEAM_RATE_RUB_DEFAULT
+
+# Для обратной совместимости в коде
+# Алиасы для чтения через геттеры (используйте _get_star_price_rub / _get_star_buy_rate_rub в коде)
+STAR_PRICE_RUB = STAR_PRICE_RUB_DEFAULT  # fallback; в расчётах используется _get_star_price_rub()
+STAR_BUY_RATE_RUB = STAR_BUY_RATE_RUB_DEFAULT
+STEAM_RATE_RUB = STEAM_RATE_RUB_DEFAULT
+
 # Цены на Premium в рублях (по умолчанию совпадают с мини‑аппом)
 PREMIUM_PRICES_RUB = {
     3: float(os.getenv("PREMIUM_PRICE_3M", "983") or "983"),
     6: float(os.getenv("PREMIUM_PRICE_6M", "1311") or "1311"),
     12: float(os.getenv("PREMIUM_PRICE_12M", "2377") or "2377"),
 }
-# Курс Steam: 1 рубль на Steam = X ₽ (из админки / env); при POST /api/steam-rate обновляется в памяти
-_steam_rate_rub_override: Optional[float] = None
-def _get_steam_rate_rub() -> float:
-    if _steam_rate_rub_override is not None and _steam_rate_rub_override > 0:
-        return _steam_rate_rub_override
-    return float(os.getenv("STEAM_RATE_RUB", "1.06") or "1.06")
-STEAM_RATE_RUB = float(os.getenv("STEAM_RATE_RUB", "1.06") or "1.06")  # fallback at import
 
 # Комиссия Platega (из админки / env): СБП % и Карты %
 _platega_sbp_commission_override: Optional[float] = None
@@ -1055,7 +1074,7 @@ async def process_sell_stars_amount(message: types.Message, state: FSMContext):
         return
 
     # Примерная сумма выплаты в рублях
-    payout_rub = stars * STAR_BUY_RATE_RUB
+    payout_rub = stars * _get_star_buy_rate_rub()
 
     await state.clear()
 
@@ -1065,7 +1084,7 @@ async def process_sell_stars_amount(message: types.Message, state: FSMContext):
         title="Продажа Telegram Stars",
         description=(
             f"Вы продаёте {stars} ⭐ Telegram Stars.\n\n"
-            f"Примерная выплата: <b>{payout_rub:.2f} ₽</b> по курсу {STAR_BUY_RATE_RUB} ₽ за 1 ⭐."
+            f"Примерная выплата: <b>{payout_rub:.2f} ₽</b> по курсу {_get_star_buy_rate_rub()} ₽ за 1 ⭐."
         ),
         payload=f"sellstars:{stars}",
         provider_token="1744374395:TEST:36675594277e9de887a6",
@@ -1105,7 +1124,7 @@ async def process_successful_payment(message: types.Message):
         order_id = payload.split(":", 1)[1].strip()
         order = PENDING_SELL_STARS_ORDERS.pop(order_id, None)
         stars = sp.total_amount
-        payout_rub = stars * STAR_BUY_RATE_RUB
+        payout_rub = stars * _get_star_buy_rate_rub()
         seller_username = f"@{user.username}" if user.username else (user.full_name or str(user.id))
 
         notify_text = (
@@ -1148,7 +1167,7 @@ async def process_successful_payment(message: types.Message):
         except Exception:
             stars = sp.total_amount
 
-        payout_rub = stars * STAR_BUY_RATE_RUB
+        payout_rub = stars * _get_star_buy_rate_rub()
         seller_username = f"@{user.username}" if user.username else (user.full_name or str(user.id))
 
         notify_text = (
@@ -2159,6 +2178,42 @@ def setup_http_server():
 
     _load_platega_commission_from_file()
 
+    # Курсы звёзд и Steam: загрузка из файла (заданы в админке)
+    APP_RATES_FILE = os.path.join(_script_dir, "app_rates.json")
+
+    def _load_app_rates_from_file():
+        global _star_price_rub_override, _star_buy_rate_rub_override, _steam_rate_rub_override
+        try:
+            data = _read_json_file(APP_RATES_FILE) or {}
+            if isinstance(data, dict):
+                v = data.get("star_price_rub")
+                if v is not None and v != "":
+                    _star_price_rub_override = float(v)
+                v = data.get("star_buy_rate_rub")
+                if v is not None and v != "":
+                    _star_buy_rate_rub_override = float(v)
+                v = data.get("steam_rate_rub")
+                if v is not None and v != "":
+                    _steam_rate_rub_override = float(v)
+        except Exception as e:
+            logger.warning("Failed to load app rates from file: %s", e)
+
+    def _save_app_rates_to_file():
+        try:
+            data = {}
+            if _star_price_rub_override is not None:
+                data["star_price_rub"] = _star_price_rub_override
+            if _star_buy_rate_rub_override is not None:
+                data["star_buy_rate_rub"] = _star_buy_rate_rub_override
+            if _steam_rate_rub_override is not None:
+                data["steam_rate_rub"] = _steam_rate_rub_override
+            if data:
+                _save_json_file(APP_RATES_FILE, data)
+        except Exception as e:
+            logger.warning("Failed to save app rates to file: %s", e)
+
+    _load_app_rates_from_file()
+
     # Preflight для CORS
     app.router.add_route('OPTIONS', '/api/telegram/user', lambda r: Response(status=204, headers={
         'Access-Control-Allow-Origin': '*',
@@ -2214,6 +2269,79 @@ def setup_http_server():
 
     app.router.add_post("/api/admin/verify", admin_verify_handler)
     app.router.add_route("OPTIONS", "/api/admin/verify", lambda r: Response(status=204, headers=_cors_headers()))
+
+    async def admin_stats_handler(request):
+        """GET /api/admin/stats — статистика для админки. Заголовок: Authorization: Bearer <ADMIN_PASSWORD>"""
+        try:
+            auth = request.headers.get("Authorization") or ""
+            token = (auth.replace("Bearer ", "").replace("bearer ", "").strip() if auth else "") or request.headers.get("X-Admin-Password") or ""
+            if not ADMIN_PASSWORD or token != ADMIN_PASSWORD:
+                return _json_response({"error": "unauthorized"}, status=401)
+            path = _get_users_data_path()
+            users_data = _read_json_file(path) if path else {}
+            if not isinstance(users_data, dict):
+                users_data = {}
+            now = datetime.now()
+            today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            week_start = now.timestamp() - 7 * 24 * 3600
+            month_start = now.timestamp() - 30 * 24 * 3600
+            total_users = len(users_data)
+            total_sales = 0
+            total_turnover_rub = 0.0
+            sales_today = sales_week = sales_month = 0
+            turnover_today = turnover_week = turnover_month = 0.0
+            for uid, u in users_data.items():
+                if not isinstance(u, dict):
+                    continue
+                for p in (u.get("purchases") or []):
+                    if not isinstance(p, dict):
+                        continue
+                    amount = float(p.get("amount") or p.get("amount_rub") or 0)
+                    total_sales += 1
+                    total_turnover_rub += amount
+                    ts = None
+                    try:
+                        dt = p.get("date") or p.get("created_at") or p.get("timestamp")
+                        if dt:
+                            s = str(dt).replace("T", " ")[:19]
+                            ts = datetime.strptime(s, "%Y-%m-%d %H:%M:%S").timestamp()
+                        elif isinstance(dt, (int, float)):
+                            ts = float(dt) if dt > 1e9 else dt
+                    except Exception:
+                        pass
+                    if ts is not None:
+                        if ts >= today_start.timestamp():
+                            sales_today += 1
+                            turnover_today += amount
+                        if ts >= week_start:
+                            sales_week += 1
+                            turnover_week += amount
+                        if ts >= month_start:
+                            sales_month += 1
+                            turnover_month += amount
+            return _json_response({
+                "totalUsers": total_users,
+                "totalSales": total_sales,
+                "totalTurnoverRub": round(total_turnover_rub, 2),
+                "salesToday": sales_today,
+                "salesWeek": sales_week,
+                "salesMonth": sales_month,
+                "turnoverToday": round(turnover_today, 2),
+                "turnoverWeek": round(turnover_week, 2),
+                "turnoverMonth": round(turnover_month, 2),
+                "regsDay": 0,
+                "regsWeek": 0,
+                "regsMonth": 0,
+                "activityDay": 0,
+                "activityWeek": 0,
+                "activityMonth": 0,
+            })
+        except Exception as e:
+            logger.error("admin_stats error: %s", e)
+            return _json_response({"error": str(e)}, status=500)
+
+    app.router.add_get("/api/admin/stats", admin_stats_handler)
+    app.router.add_route("OPTIONS", "/api/admin/stats", lambda r: Response(status=204, headers=_cors_headers()))
 
     # Отдаём robots.txt, чтобы боты (например, Яндекс) не вызывали 404 и не засоряли логи
     async def robots_handler(request):
@@ -2398,6 +2526,7 @@ def setup_http_server():
             if rate < 0.01 or rate > 100:
                 return _json_response({"error": "bad_request", "message": "Курс должен быть от 0.01 до 100"}, status=400)
             _steam_rate_rub_override = rate
+            _save_app_rates_to_file()
             return _json_response({"steam_rate_rub": _steam_rate_rub_override})
         try:
             rate = _get_steam_rate_rub()
@@ -2409,6 +2538,52 @@ def setup_http_server():
     app.router.add_get('/api/steam-rate', steam_rate_handler)
     app.router.add_post('/api/steam-rate', steam_rate_handler)
     app.router.add_route('OPTIONS', '/api/steam-rate', lambda r: Response(status=204, headers=_cors_headers()))
+
+    async def star_rate_handler(request):
+        """Курсы звёзд: GET — текущие, POST — установить из админки (body: { star_price_rub?, star_buy_rate_rub? })."""
+        global _star_price_rub_override, _star_buy_rate_rub_override
+        if request.method == "POST":
+            try:
+                body = await request.json()
+            except Exception:
+                return _json_response({"error": "bad_request", "message": "Invalid JSON"}, status=400)
+            updated = False
+            v = body.get("star_price_rub")
+            if v is not None and v != "":
+                try:
+                    r = float(v)
+                    if 0.01 <= r <= 1000:
+                        _star_price_rub_override = r
+                        updated = True
+                except (TypeError, ValueError):
+                    pass
+            v = body.get("star_buy_rate_rub")
+            if v is not None and v != "":
+                try:
+                    r = float(v)
+                    if 0.01 <= r <= 100:
+                        _star_buy_rate_rub_override = r
+                        updated = True
+                except (TypeError, ValueError):
+                    pass
+            if updated:
+                _save_app_rates_to_file()
+            return _json_response({
+                "star_price_rub": _get_star_price_rub(),
+                "star_buy_rate_rub": _get_star_buy_rate_rub(),
+            })
+        try:
+            return _json_response({
+                "star_price_rub": _get_star_price_rub(),
+                "star_buy_rate_rub": _get_star_buy_rate_rub(),
+            })
+        except Exception as e:
+            logger.warning("star_rate GET error: %s", e)
+            return _json_response({"star_price_rub": 1.37, "star_buy_rate_rub": 0.65})
+
+    app.router.add_get('/api/star-rate', star_rate_handler)
+    app.router.add_post('/api/star-rate', star_rate_handler)
+    app.router.add_route('OPTIONS', '/api/star-rate', lambda r: Response(status=204, headers=_cors_headers()))
 
     # Комиссия Platega: СБП % и Карты % (GET — текущие, POST — установить из админки)
     async def platega_commission_handler(request):
@@ -2885,7 +3060,7 @@ def setup_http_server():
             return _json_response({"error": "bad_request", "message": "method: wallet, sbp или card"}, status=400)
 
         order_id = str(uuid.uuid4())
-        payout_rub = round(stars_amount * STAR_BUY_RATE_RUB, 2)
+        payout_rub = round(stars_amount * _get_star_buy_rate_rub(), 2)
 
         order_data = {
             "user_id": telegram_id,
@@ -4067,7 +4242,7 @@ def setup_http_server():
 
         # ----------- Покупка (звёзды / премиум / Steam) -----------
         # ВАЖНО: клиент НЕ задаёт цену и payload. Только type + минимальные данные.
-        # Цена считается на бэке из stars_amount * STAR_PRICE_RUB и т.д.
+        # Цена считается на бэке из stars_amount * _get_star_price_rub() и т.д.
         if context == "purchase":
             purchase = body.get("purchase") or {}
             ptype = (purchase.get("type") or "").strip()
@@ -4091,7 +4266,7 @@ def setup_http_server():
                 stars_err = _validate_stars_amount(stars_amount)
                 if stars_err:
                     return _json_response({"error": "bad_request", "message": stars_err}, status=400)
-                amount = round(stars_amount * STAR_PRICE_RUB, 2)
+                amount = round(stars_amount * _get_star_price_rub(), 2)
                 if amount < 1:
                     amount = 1.0
                 description = f"Звёзды Telegram — {stars_amount} шт. для @{login_val}"
@@ -4681,7 +4856,7 @@ def setup_http_server():
             stars_err = _validate_stars_amount(stars_amount)
             if stars_err:
                 return _json_response({"error": "bad_request", "message": stars_err}, status=400)
-            amount = round(stars_amount * STAR_PRICE_RUB, 2)
+            amount = round(stars_amount * _get_star_price_rub(), 2)
             if amount < 1:
                 amount = 1.0
             purchase["login"] = login_val
@@ -4975,7 +5150,7 @@ def setup_http_server():
             stars_err = _validate_stars_amount(stars_amount)
             if stars_err:
                 return _json_response({"error": "bad_request", "message": stars_err}, status=400)
-            amount = round(stars_amount * STAR_PRICE_RUB, 2)
+            amount = round(stars_amount * _get_star_price_rub(), 2)
             if amount < 1:
                 amount = 1.0
             purchase["login"] = login_val
