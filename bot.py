@@ -3359,6 +3359,7 @@ def setup_http_server():
     # FreeKassa — приём СБП и карт через API (https://docs.freekassa.net/)
     FREEKASSA_SHOP_ID = (os.getenv("FREEKASSA_SHOP_ID") or "").strip()
     FREEKASSA_API_KEY = _get_env_clean("FREEKASSA_API_KEY") or ""
+    FREEKASSA_SECRET1 = _get_env_clean("FREEKASSA_SECRET1") or ""
     FREEKASSA_SECRET2 = _get_env_clean("FREEKASSA_SECRET2") or ""
 
     def _get_client_ip(request: web.Request) -> str:
@@ -5408,7 +5409,7 @@ def setup_http_server():
             "i": int(fk_i),
             "email": email,
             "ip": ip,
-            "amount": amount_value,
+            "amount": amount_value,  # Число с десятичными знаками
             "currency": "RUB",
         }
         
@@ -5418,15 +5419,29 @@ def setup_http_server():
             return _json_response({"error": "bad_config", "message": "FREEKASSA_API_KEY не задан"}, status=503)
 
         # Подпись: HMAC-SHA256 от отсортированных значений (ключи по алфавиту, значения через |)
-        # Порядок параметров: amount|currency|email|i|ip|nonce|paymentId|shopId
+        # Порядок параметров должен быть: amount|currency|email|i|ip|nonce|paymentId|shopId
+        # ВАЖНО: для подписи НЕ включаем поле "signature"
         items = sorted(data.items(), key=lambda kv: kv[0])
         sign_source = "|".join(str(v) for _, v in items)
-        sign = hmac.new(FREEKASSA_API_KEY.encode("utf-8"), sign_source.encode("utf-8"), hashlib.sha256).hexdigest()
+        
+        # Определяем ключ для подписи: SECRET1 (если задан) или API_KEY
+        sign_key = FREEKASSA_SECRET1 if FREEKASSA_SECRET1 else FREEKASSA_API_KEY
+        
+        # Проверяем, что ключ для подписи не пустой
+        if not sign_key or len(sign_key.strip()) < 10:
+            logger.error(f"FreeKassa sign key invalid: SECRET1 length={len(FREEKASSA_SECRET1) if FREEKASSA_SECRET1 else 0}, API_KEY length={len(FREEKASSA_API_KEY) if FREEKASSA_API_KEY else 0}")
+            return _json_response({"error": "bad_config", "message": "FREEKASSA_SECRET1 или FREEKASSA_API_KEY должны быть заданы"}, status=503)
+        
+        sign = hmac.new(sign_key.encode("utf-8"), sign_source.encode("utf-8"), hashlib.sha256).hexdigest()
         data["signature"] = sign
+        
+        logger.info("FreeKassa: Using %s for signature (length=%d)", "SECRET1" if FREEKASSA_SECRET1 else "API_KEY", len(sign_key))
 
-        logger.info("FreeKassa create-order: paymentId=%s, i=%s, amount=%s", payment_id, fk_i, amount_value)
-        logger.info("FreeKassa sign_source: %s", sign_source)
-        logger.info("FreeKassa signature: %s", sign[:16] + "..." if len(sign) > 16 else sign)
+        logger.info("FreeKassa create-order: paymentId=%s, i=%s, amount=%.2f, shopId=%s", payment_id, fk_i, amount_value, shop_id_int)
+        logger.info("FreeKassa sign_source (for signature): %s", sign_source)
+        logger.info("FreeKassa signature (first 32 chars): %s", sign[:32])
+        logger.info("FreeKassa sign_key type: %s, length: %d", "SECRET1" if FREEKASSA_SECRET1 else "API_KEY", len(sign_key))
+        logger.debug("FreeKassa full data (without signature): %s", {k: v for k, v in data.items() if k != "signature"})
 
         try:
             async with aiohttp.ClientSession() as session:
