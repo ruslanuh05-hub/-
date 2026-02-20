@@ -5433,37 +5433,46 @@ def setup_http_server():
             return _json_response({"error": "bad_config", "message": "FREEKASSA_API_KEY не задан"}, status=503)
 
         # Подпись: HMAC-SHA256 от отсортированных значений (ключи по алфавиту, значения через |)
-        # Порядок параметров должен быть: amount|currency|email|i|ip|nonce|paymentId|shopId
+        # По документации: сортируем по ключам в алфавитном порядке, конкатенируем значения через |
+        # Хешируем sha256 используя API_KEY (НЕ SECRET1!)
         # ВАЖНО: для подписи НЕ включаем поле "signature"
+        # Форматируем значения: числа без лишних нулей (212.0 -> "212"), строки как есть
+        def format_sign_value(v):
+            if isinstance(v, float):
+                # Убираем лишние нули: 212.0 -> "212", 212.5 -> "212.5"
+                if v == int(v):
+                    return str(int(v))
+                return str(v)
+            return str(v)
+        
         items = sorted(data.items(), key=lambda kv: kv[0])
-        sign_source = "|".join(str(v) for _, v in items)
+        sign_source = "|".join(format_sign_value(v) for _, v in items)
         
-        # Определяем ключ для подписи: SECRET1 (если задан) или API_KEY
-        sign_key = FREEKASSA_SECRET1 if FREEKASSA_SECRET1 else FREEKASSA_API_KEY
+        # По документации FreeKassa API используется именно API_KEY для подписи
+        if not FREEKASSA_API_KEY or len(FREEKASSA_API_KEY.strip()) < 10:
+            logger.error(f"FreeKassa API_KEY invalid: length={len(FREEKASSA_API_KEY) if FREEKASSA_API_KEY else 0}")
+            return _json_response({"error": "bad_config", "message": "FREEKASSA_API_KEY должен быть задан"}, status=503)
         
-        # Проверяем, что ключ для подписи не пустой
-        if not sign_key or len(sign_key.strip()) < 10:
-            logger.error(f"FreeKassa sign key invalid: SECRET1 length={len(FREEKASSA_SECRET1) if FREEKASSA_SECRET1 else 0}, API_KEY length={len(FREEKASSA_API_KEY) if FREEKASSA_API_KEY else 0}")
-            return _json_response({"error": "bad_config", "message": "FREEKASSA_SECRET1 или FREEKASSA_API_KEY должны быть заданы"}, status=503)
-        
-        sign = hmac.new(sign_key.encode("utf-8"), sign_source.encode("utf-8"), hashlib.sha256).hexdigest()
+        sign = hmac.new(FREEKASSA_API_KEY.encode("utf-8"), sign_source.encode("utf-8"), hashlib.sha256).hexdigest()
         data["signature"] = sign
         
-        logger.info("FreeKassa: Using %s for signature (length=%d)", "SECRET1" if FREEKASSA_SECRET1 else "API_KEY", len(sign_key))
+        logger.info("FreeKassa: Using API_KEY for signature (length=%d)", len(FREEKASSA_API_KEY))
 
         logger.info("FreeKassa create-order: paymentId=%s, i=%s, amount=%.2f, shopId=%s", payment_id, fk_i, amount_value, shop_id_int)
-        logger.info("FreeKassa sign_source (for signature): %s", sign_source)
-        logger.info("FreeKassa signature (first 32 chars): %s", sign[:32])
-        logger.info("FreeKassa sign_key type: %s, length: %d", "SECRET1" if FREEKASSA_SECRET1 else "API_KEY", len(sign_key))
+        logger.info("FreeKassa sign_source (sorted values joined by |): %s", sign_source)
+        logger.info("FreeKassa signature (HMAC-SHA256): %s", sign)
         logger.debug("FreeKassa full data (without signature): %s", {k: v for k, v in data.items() if k != "signature"})
 
         try:
             timeout = aiohttp.ClientTimeout(total=30, connect=10)
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                logger.info("FreeKassa: Sending request to https://api.fk.life/v1/orders/create")
-                logger.debug("FreeKassa request data: %s", json.dumps({k: v for k, v in data.items() if k != "signature"}, ensure_ascii=False))
+                # По документации: POST запрос с JSON телом на https://api.fk.life/v1/orders/create
+                url = "https://api.fk.life/v1/orders/create"
+                logger.info("FreeKassa: Sending POST request to %s", url)
+                logger.debug("FreeKassa request data (full): %s", json.dumps(data, ensure_ascii=False))
+                logger.debug("FreeKassa request data (without signature): %s", json.dumps({k: v for k, v in data.items() if k != "signature"}, ensure_ascii=False))
                 try:
-                    async with session.post("https://api.fk.life/v1/orders/create", json=data, headers={"Content-Type": "application/json"}) as resp:
+                    async with session.post(url, json=data, headers={"Content-Type": "application/json"}) as resp:
                         text = await resp.text()
                         logger.info("FreeKassa response: status=%d, headers=%s", resp.status, dict(resp.headers))
                         logger.debug("FreeKassa response body: %s", text[:500])
