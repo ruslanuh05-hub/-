@@ -2308,8 +2308,27 @@ def setup_http_server():
             token = (auth.replace("Bearer ", "").replace("bearer ", "").strip() if auth else "") or request.headers.get("X-Admin-Password") or ""
             if not ADMIN_PASSWORD or token != ADMIN_PASSWORD:
                 return _json_response({"error": "unauthorized"}, status=401)
-            path = _get_users_data_path()
-            users_data = _read_json_file(path) if path else {}
+            
+            # Пытаемся получить данные из PostgreSQL, если БД включена
+            users_data = {}
+            import db as _db_stats
+            if _db_stats.is_enabled():
+                try:
+                    users_data = await _db_stats.get_users_with_purchases()
+                    logger.info(f"admin_stats: Loaded {len(users_data)} users from PostgreSQL")
+                except Exception as db_err:
+                    logger.warning(f"admin_stats: Failed to load from PostgreSQL: {db_err}, falling back to JSON")
+                    users_data = {}
+            
+            # Если PostgreSQL не включена или произошла ошибка — читаем из JSON
+            if not users_data:
+                path = _get_users_data_path()
+                users_data = _read_json_file(path) if path else {}
+                if path:
+                    logger.info(f"admin_stats: Loaded from JSON file: {path}, {len(users_data)} users")
+                else:
+                    logger.warning("admin_stats: No users_data.json path found")
+            
             if not isinstance(users_data, dict):
                 users_data = {}
             now = datetime.now()
@@ -2321,10 +2340,16 @@ def setup_http_server():
             total_turnover_rub = 0.0
             sales_today = sales_week = sales_month = 0
             turnover_today = turnover_week = turnover_month = 0.0
+            
+            logger.info(f"admin_stats: Processing {total_users} users")
+            
             for uid, u in users_data.items():
                 if not isinstance(u, dict):
                     continue
-                for p in (u.get("purchases") or []):
+                purchases_list = u.get("purchases") or []
+                if not purchases_list:
+                    continue
+                for p in purchases_list:
                     if not isinstance(p, dict):
                         continue
                     amount = float(p.get("amount") or p.get("amount_rub") or 0)
@@ -2350,6 +2375,56 @@ def setup_http_server():
                         if ts >= month_start:
                             sales_month += 1
                             turnover_month += amount
+            
+            # Подсчёт регистраций по периодам
+            regs_day = regs_week = regs_month = 0
+            activity_day = activity_week = activity_month = 0
+            
+            for uid, u in users_data.items():
+                if not isinstance(u, dict):
+                    continue
+                # Проверяем дату регистрации
+                reg_date = u.get("registration_date") or u.get("created_at")
+                if reg_date:
+                    try:
+                        if isinstance(reg_date, str):
+                            reg_ts = datetime.strptime(reg_date[:19], "%Y-%m-%d %H:%M:%S").timestamp()
+                        elif isinstance(reg_date, (int, float)):
+                            reg_ts = float(reg_date) if reg_date > 1e9 else reg_date
+                        else:
+                            reg_ts = None
+                        if reg_ts:
+                            if reg_ts >= today_start.timestamp():
+                                regs_day += 1
+                            if reg_ts >= week_start:
+                                regs_week += 1
+                            if reg_ts >= month_start:
+                                regs_month += 1
+                    except Exception:
+                        pass
+                
+                # Проверяем активность (last_activity)
+                last_act = u.get("last_activity") or u.get("updated_at")
+                if last_act:
+                    try:
+                        if isinstance(last_act, str):
+                            act_ts = datetime.strptime(last_act[:19], "%Y-%m-%d %H:%M:%S").timestamp()
+                        elif isinstance(last_act, (int, float)):
+                            act_ts = float(last_act) if last_act > 1e9 else last_act
+                        else:
+                            act_ts = None
+                        if act_ts:
+                            if act_ts >= today_start.timestamp():
+                                activity_day += 1
+                            if act_ts >= week_start:
+                                activity_week += 1
+                            if act_ts >= month_start:
+                                activity_month += 1
+                    except Exception:
+                        pass
+            
+            logger.info(f"admin_stats: total_users={total_users}, total_sales={total_sales}, total_turnover={total_turnover_rub:.2f}, regs_day={regs_day}, activity_day={activity_day}")
+            
             return _json_response({
                 "totalUsers": total_users,
                 "totalSales": total_sales,
@@ -2360,12 +2435,12 @@ def setup_http_server():
                 "turnoverToday": round(turnover_today, 2),
                 "turnoverWeek": round(turnover_week, 2),
                 "turnoverMonth": round(turnover_month, 2),
-                "regsDay": 0,
-                "regsWeek": 0,
-                "regsMonth": 0,
-                "activityDay": 0,
-                "activityWeek": 0,
-                "activityMonth": 0,
+                "regsDay": regs_day,
+                "regsWeek": regs_week,
+                "regsMonth": regs_month,
+                "activityDay": activity_day,
+                "activityWeek": activity_week,
+                "activityMonth": activity_month,
             })
         except Exception as e:
             logger.error("admin_stats error: %s", e)
