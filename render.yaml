@@ -1,0 +1,19 @@
+# Render Blueprint - автодеплой JET Store Bot
+services:
+  - type: web
+    name: jet-store-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: WEB_APP_URL
+        sync: false
+      - key: CRYPTOBOT_USDT_AMOUNT
+        sync: false
+      - key: CRYPTO_PAY_TOKEN
+        sync: false
