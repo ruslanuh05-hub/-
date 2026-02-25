@@ -6102,9 +6102,19 @@ def setup_http_server():
     app.router.add_get("/api/freekassa/notify", freekassa_notify_handler)
     app.router.add_post("/api/freekassa/notify", freekassa_notify_handler)
 
-    # Health-check для Railway: чтобы не было 404 на /api/health
+    # Health-check: чтобы не было 404 на /api/health
     async def health_handler(request):
         return _json_response({"status": "ok"})
+
+    # Простой индекс по корню, чтобы GET / не давал 404
+    async def index_handler(request):
+        return Response(
+            text="JetStore backend is running. Use /api/* endpoints.",
+            content_type="text/plain",
+        )
+
+    # Корневой маршрут
+    app.router.add_get("/", index_handler)
 
     # Обычный healthcheck по относительному пути
     app.router.add_get("/api/health", health_handler)
