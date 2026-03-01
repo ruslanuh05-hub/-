@@ -1081,7 +1081,15 @@ def get_language_keyboard():
 async def cmd_start(message: types.Message, state: FSMContext):
     """Стартовое приветствие без выбора языка"""
     user = message.from_user
-    
+
+    # Синхронизируем пользователя с PostgreSQL (для админки и баланса)
+    try:
+        import db as _db_pg
+        if _db_pg.is_enabled():
+            await _db_pg.user_upsert(str(user.id), user.username or "", user.first_name or "")
+    except Exception as e:
+        logger.warning("cmd_start: failed to upsert user in PostgreSQL: %s", e)
+
     # Регистрируем пользователя (если ещё нет) с языком по умолчанию ru
     user_data = db.get_user(user.id)
     if not user_data:
@@ -6032,7 +6040,15 @@ def setup_http_server():
                         f"Пополнение баланса на {amount_rub:.0f} ₽",
                         purchase.get("order_id"),
                     )
-                logger.info("FreeKassa notify: balance deposit delivered, MERCHANT_ORDER_ID=%s, amount_rub=%s", merchant_order_id, amount_rub)
+                    logger.info("FreeKassa notify: balance deposit delivered, MERCHANT_ORDER_ID=%s, amount_rub=%s", merchant_order_id, amount_rub)
+                else:
+                    if amount_rub > 0 and not _db_bal.is_enabled():
+                        logger.warning(
+                            "FreeKassa notify: DATABASE_URL не задан — баланс НЕ зачислен в БД! "
+                            "user_id=%s, amount_rub=%s. Задайте DATABASE_URL для работы баланса.",
+                            user_id, amount_rub
+                        )
+                    logger.info("FreeKassa notify: balance deposit delivered, MERCHANT_ORDER_ID=%s, amount_rub=%s", merchant_order_id, amount_rub)
             elif ptype == "steam":
                 account = (purchase.get("login") or "").strip()
                 amount_steam = purchase.get("amount_steam") or purchase.get("amount") or amount_rub
