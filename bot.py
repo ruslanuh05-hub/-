@@ -6657,8 +6657,8 @@ async def main():
         webhook_handler = SimpleRequestHandler(dispatcher=dp, bot=bot, handle_in_background=True)
         webhook_handler.register(http_app, path=webhook_path)
         setup_application(http_app, dp, bot=bot)
-        async def _on_webhook_startup(bot_instance: Bot):
-            await bot_instance.set_webhook(f"{webhook_base}{webhook_path}")
+        async def _on_webhook_startup(bot: Bot):
+            await bot.set_webhook(f"{webhook_base}{webhook_path}")
             logger.info("Webhook установлен: %s%s", webhook_base, webhook_path)
         dp.startup.register(_on_webhook_startup)
         print(f"🔗 Режим WEBHOOK: обновления на {webhook_base}{webhook_path}")
