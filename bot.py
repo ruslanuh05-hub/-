@@ -496,6 +496,12 @@ async def _apply_referral_earnings_for_purchase(
 ) -> None:
     """
     Начисляет реферальные проценты за покупку пользователя по цепочке parent1/parent2/parent3.
+    
+    Новая логика: прогрессивный процент в зависимости от суммарного объёма покупок рефералов (в звёздах):
+    - до 50 000 звёзд → 3% от суммы в рублях
+    - от 50 000 до 100 000 звёзд → 5%
+    - от 100 000 до 200 000 звёзд → 7%
+    
     Всегда работает через общую систему REFERRALS + _save_referrals(),
     которая сама решает, писать в PostgreSQL или JSON (fallback).
     Так мы исключаем расхождения между разными путями начисления.
@@ -522,20 +528,47 @@ async def _apply_referral_earnings_for_purchase(
     if first_name and not user_ref.get("first_name"):
         user_ref["first_name"] = first_name
 
-    # Проценты JetRefs: 1‑й уровень 4%, 2‑й — 8%, 3‑й — 12%
-    parents = (
-        (user_ref.get("parent1"), 0.04),
-        (user_ref.get("parent2"), 0.08),
-        (user_ref.get("parent3"), 0.12),
-    )
+    # Определяем процент по объёму покупок parent1 (в звёздах, но храним объём в рублях)
+    # Для простоты: 1 звезда ≈ 2.8 ₽ (средний курс)
+    # Пороги: 50k звёзд = 140k ₽, 100k звёзд = 280k ₽, 200k звёзд = 560k ₽
+    def _calc_percent_by_volume_rub(volume_rub: float) -> float:
+        """Расчёт процента по объёму в рублях (примерная конвертация из звёзд)."""
+        # Примерный курс: 1 звезда ≈ 2.8 ₽
+        volume_stars = volume_rub / 2.8
+        if volume_stars < 50000:
+            return 0.03  # 3%
+        elif volume_stars < 100000:
+            return 0.05  # 5%
+        elif volume_stars < 200000:
+            return 0.07  # 7%
+        else:
+            return 0.07  # максимум 7%
+
+    # Начисляем только на parent1, parent2, parent3 — одинаковый процент для всех.
+    # Награда сразу зачисляется на RUB-баланс родителя.
+    parents = [user_ref.get("parent1"), user_ref.get("parent2"), user_ref.get("parent3")]
     any_parent = False
-    for pid, percent in parents:
+    for pid in parents:
         if not pid:
             continue
         any_parent = True
         pref = await _get_or_create_ref_user(pid)
+        # Обновляем объём parent'а
         pref["volume_rub"] = float(pref.get("volume_rub") or 0.0) + amount
-        pref["earned_rub"] = float(pref.get("earned_rub") or 0.0) + amount * percent
+        # Определяем процент по **новому** объёму parent'а
+        percent = _calc_percent_by_volume_rub(pref["volume_rub"])
+        # Награда за эту покупку
+        bonus = amount * percent
+        if bonus <= 0:
+            continue
+        pref["earned_rub"] = float(pref.get("earned_rub") or 0.0) + bonus
+        # Мгновенно зачисляем на баланс родителя (если доступна БД)
+        try:
+            import db as _db_ref
+            if _db_ref.is_enabled():
+                await _db_ref.balance_add_rub(str(pid), bonus)
+        except Exception as e:
+            logger.warning("apply_referral_earnings: failed to credit balance for parent %s: %s", pid, e)
 
     if not any_parent:
         logger.info("apply_referral_earnings: у пользователя %s нет parent1/2/3, начислять некому", uid)
@@ -2396,6 +2429,9 @@ def setup_http_server():
             total_turnover_rub = 0.0
             sales_today = sales_week = sales_month = 0
             turnover_today = turnover_week = turnover_month = 0.0
+            # Отдельная статистика по пополнениям баланса (type='balance')
+            balance_topups_count = 0
+            balance_topups_rub = 0.0
             
             logger.info(f"admin_stats: Processing {total_users} users")
             
@@ -2409,8 +2445,12 @@ def setup_http_server():
                     if not isinstance(p, dict):
                         continue
                     amount = float(p.get("amount") or p.get("amount_rub") or 0)
+                    ptype = (p.get("type") or "").strip().lower()
                     total_sales += 1
                     total_turnover_rub += amount
+                    if ptype == "balance":
+                        balance_topups_count += 1
+                        balance_topups_rub += amount
                     ts = None
                     try:
                         dt = p.get("date") or p.get("created_at") or p.get("timestamp")
@@ -2497,6 +2537,8 @@ def setup_http_server():
                 "activityDay": activity_day,
                 "activityWeek": activity_week,
                 "activityMonth": activity_month,
+                "balanceTopupsCount": balance_topups_count,
+                "balanceTopupsRub": round(balance_topups_rub, 2),
             })
         except Exception as e:
             logger.error("admin_stats error: %s", e)
@@ -3151,6 +3193,9 @@ def setup_http_server():
         """
         Статистика реферальной программы для пользователя.
         GET /api/referral/stats?user_id=...
+        
+        В новой логике вся реферальная награда сразу зачисляется на баланс в рублях.
+        Здесь возвращаем только статистику в RUB (без TON).
         """
         user_id = request.rel_url.query.get("user_id", "").strip()
         if not user_id:
@@ -3171,58 +3216,14 @@ def setup_http_server():
 
         earned_rub = float(ref.get("earned_rub") or 0.0)
         volume_rub = float(ref.get("volume_rub") or 0.0)
-
-        # Курс TON (RUB за 1 TON)
-        ton_rate = await _get_ton_rate_rub()
-        if ton_rate <= 0:
-            ton_rate = 600.0
-        earned_ton = round(earned_rub / ton_rate, 6) if earned_rub > 0 else 0.0
-        volume_ton = round(volume_rub / ton_rate, 6) if volume_rub > 0 else 0.0
-
-        # Уровни JetRefs по объёму в TON:
-        # 1 уровень: 0–4999.99 TON
-        # 2 уровень: 5000–14999.99 TON
-        # 3 уровень: 15000+ TON
-        L2_TON = 5000.0
-        L3_TON = 15000.0
-        max_level = 3
-        if volume_ton >= L3_TON:
-            level = 3
-            progress_percent = 100
-            to_next_volume_rub = 0.0
-            remaining_ton = 0.0
-        else:
-            if volume_ton >= L2_TON:
-                level = 2
-                base = L2_TON
-                target = L3_TON
-            else:
-                level = 1
-                base = 0.0
-                target = L2_TON
-            span = max(1.0, target - base)
-            done = max(0.0, volume_ton - base)
-            progress_percent = int(round(min(1.0, done / span) * 100))
-            remaining_ton = max(0.0, target - volume_ton)
-            to_next_volume_rub = remaining_ton * ton_rate
-
-        to_next_volume_ton = round(remaining_ton, 6) if volume_ton < L3_TON else 0.0
         payload = {
             "user_id": uid,
             "earned_rub": round(earned_rub, 2),
-            "earned_ton": earned_ton,
             "volume_rub": round(volume_rub, 2),
-            "volume_ton": volume_ton,
             "referrals_level1": lvl1,
             "referrals_level2": lvl2,
             "referrals_level3": lvl3,
             "total_referrals": total_refs,
-            "level": level,
-            "max_level": max_level,
-            "progress_percent": progress_percent,
-            "to_next_volume_rub": round(to_next_volume_rub, 2),
-            "to_next_volume_ton": to_next_volume_ton,
-            "ton_rate_rub": ton_rate,
         }
         return _json_response(payload)
 
