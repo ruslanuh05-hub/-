@@ -28,6 +28,7 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from telethon import TelegramClient
 from telethon.errors import UsernameInvalidError, UsernameNotOccupiedError
 from telethon.sessions import StringSession
@@ -2403,7 +2404,7 @@ def setup_http_server():
             import db as _db_stats
             if _db_stats.is_enabled():
                 try:
-                    users_data = await _db_stats.get_users_with_purchases()
+                    users_data = await _db_stats.get_users_with_purchases(stars_only=False)
                     logger.info(f"admin_stats: Loaded {len(users_data)} users from PostgreSQL")
                 except Exception as db_err:
                     logger.warning(f"admin_stats: Failed to load from PostgreSQL: {db_err}, falling back to JSON")
@@ -4568,6 +4569,7 @@ def setup_http_server():
 
         context = (body.get("context") or "").strip() or "deposit"
         user_id = str(body.get("user_id") or body.get("userId") or "").strip() or "unknown"
+        ptype = ""
 
         amount: float
         description: str
@@ -4580,7 +4582,7 @@ def setup_http_server():
         # Цена считается на бэке из stars_amount * курс (из БД или файла)
         if context == "purchase":
             purchase = body.get("purchase") or {}
-            ptype = (purchase.get("type") or "").strip()
+            ptype = (purchase.get("type") or "").strip().lower()
             if not _validate_user_id(user_id):
                 return _json_response({"error": "bad_request", "message": "Некорректный user_id"}, status=400)
             rates_db = {}
@@ -6644,6 +6646,23 @@ async def main():
 
     # Настраиваем HTTP сервер для API
     http_app = setup_http_server()
+    
+    # Webhook на Render: устраняет TelegramConflictError (несколько инстансов / getUpdates конфликт)
+    # RENDER_EXTERNAL_URL задаётся Render автоматически (например https://jet-store-bot-xxx.onrender.com)
+    webhook_base = (os.getenv("WEBHOOK_BASE_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").rstrip("/")
+    use_webhook = bool(webhook_base)
+    
+    if use_webhook:
+        webhook_path = "/webhook"
+        webhook_handler = SimpleRequestHandler(dispatcher=dp, bot=bot, handle_in_background=True)
+        webhook_handler.register(http_app, path=webhook_path)
+        setup_application(http_app, dp, bot=bot)
+        async def _on_webhook_startup(bot_instance: Bot):
+            await bot_instance.set_webhook(f"{webhook_base}{webhook_path}")
+            logger.info("Webhook установлен: %s%s", webhook_base, webhook_path)
+        dp.startup.register(_on_webhook_startup)
+        print(f"🔗 Режим WEBHOOK: обновления на {webhook_base}{webhook_path}")
+    
     runner = web.AppRunner(http_app)
     await runner.setup()
     port = int(os.getenv("PORT") or "3000")
@@ -6651,12 +6670,16 @@ async def main():
     await site.start()
     print(f"🌐 HTTP API сервер запущен на порту {port}")
     print("   Эндпоинт: /api/telegram/user, /api/cryptobot/create-invoice")
-    print("   Для Railway: git push → получите публичный URL бота")
     print("=" * 50)
     
     try:
-        await bot.delete_webhook(drop_pending_updates=True)
-        await dp.start_polling(bot)
+        if use_webhook:
+            logger.info("Бот в режиме webhook — ожидаю обновления")
+            while True:
+                await asyncio.sleep(3600)
+        else:
+            await bot.delete_webhook(drop_pending_updates=True)
+            await dp.start_polling(bot)
     except Exception as e:
         logger.error(f"Ошибка запуска бота: {e}")
         print(f"❌ Ошибка запуска бота: {e}")
