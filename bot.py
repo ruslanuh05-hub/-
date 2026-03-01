@@ -2398,29 +2398,65 @@ def setup_http_server():
             token = (auth.replace("Bearer ", "").replace("bearer ", "").strip() if auth else "") or request.headers.get("X-Admin-Password") or ""
             if not ADMIN_PASSWORD or token != ADMIN_PASSWORD:
                 return _json_response({"error": "unauthorized"}, status=401)
-            
-            # Пытаемся получить данные из PostgreSQL, если БД включена
-            users_data = {}
-            import db as _db_stats
-            if _db_stats.is_enabled():
-                try:
-                    users_data = await _db_stats.get_users_with_purchases(stars_only=False)
-                    logger.info(f"admin_stats: Loaded {len(users_data)} users from PostgreSQL")
-                except Exception as db_err:
-                    logger.warning(f"admin_stats: Failed to load from PostgreSQL: {db_err}, falling back to JSON")
-                    users_data = {}
-            
-            # Если PostgreSQL не включена или произошла ошибка — читаем из JSON
-            if not users_data:
-                path = _get_users_data_path()
-                users_data = _read_json_file(path) if path else {}
-                if path:
-                    logger.info(f"admin_stats: Loaded from JSON file: {path}, {len(users_data)} users")
-                else:
-                    logger.warning("admin_stats: No users_data.json path found")
-            
+            # 1) БАЗОВЫЕ ДАННЫЕ: JSON (users_data.json) — чтобы не потерять старую статистику
+            path = _get_users_data_path()
+            users_data = _read_json_file(path) if path else {}
+            if path:
+                logger.info(f"admin_stats: Loaded base stats from JSON file: {path}, {len(users_data) if isinstance(users_data, dict) else 0} users")
+            else:
+                logger.warning("admin_stats: No users_data.json path found")
+
             if not isinstance(users_data, dict):
                 users_data = {}
+
+            # 2) ДОПОЛНИТЕЛЬНО ПОДМЕШИВАЕМ PostgreSQL, если включена
+            try:
+                import db as _db_stats
+                if _db_stats.is_enabled():
+                    try:
+                        db_users = await _db_stats.get_users_with_purchases(stars_only=False)
+                        logger.info(f"admin_stats: Loaded {len(db_users)} users from PostgreSQL for merge")
+                    except Exception as db_err:
+                        logger.warning(f"admin_stats: Failed to load from PostgreSQL: {db_err}")
+                        db_users = {}
+
+                    if isinstance(db_users, dict) and db_users:
+                        for uid, u in db_users.items():
+                            if not isinstance(u, dict):
+                                continue
+                            if uid not in users_data or not isinstance(users_data.get(uid), dict):
+                                users_data[uid] = u
+                                continue
+                            # Мержим данные по пользователю
+                            base_u = users_data[uid]
+                            # username / first_name — берём из БД, если есть
+                            if u.get("username"):
+                                base_u["username"] = u.get("username")
+                            if u.get("first_name"):
+                                base_u["first_name"] = u.get("first_name")
+                            # Даты регистрации/активности
+                            if u.get("registration_date") and not base_u.get("registration_date"):
+                                base_u["registration_date"] = u.get("registration_date")
+                            if u.get("created_at") and not base_u.get("created_at"):
+                                base_u["created_at"] = u.get("created_at")
+                            if u.get("last_activity"):
+                                # Берём более позднюю активность
+                                la_base = str(base_u.get("last_activity") or "")
+                                la_db = str(u.get("last_activity") or "")
+                                if not la_base or la_db > la_base:
+                                    base_u["last_activity"] = la_db
+                            # Покупки: просто дописываем список
+                            base_p = base_u.get("purchases") or []
+                            db_p = u.get("purchases") or []
+                            if not isinstance(base_p, list):
+                                base_p = []
+                            if not isinstance(db_p, list):
+                                db_p = []
+                            base_u["purchases"] = base_p + db_p
+                            users_data[uid] = base_u
+            except Exception as merge_err:
+                logger.warning(f"admin_stats: error merging PostgreSQL stats: {merge_err}")
+            
             now = datetime.now()
             today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
             week_start = now.timestamp() - 7 * 24 * 3600
