@@ -1810,7 +1810,22 @@ def _build_notification_keyboard(buttons: list[dict] | None) -> InlineKeyboardMa
         if not text or not url:
             continue
         btn_text = _apply_button_color_emoji(text, color)
-        rows.append([InlineKeyboardButton(text=btn_text, url=url)])
+
+        # Определяем стиль кнопки по цвету
+        style = None
+        if isinstance(color, str):
+            c = color.lower()
+            if c in ("green", "success"):
+                style = "success"
+            elif c in ("red", "danger"):
+                style = "danger"
+            elif c in ("primary", "blue"):
+                style = "primary"
+
+        if style:
+            rows.append([InlineKeyboardButton(text=btn_text, url=url, style=style)])
+        else:
+            rows.append([InlineKeyboardButton(text=btn_text, url=url)])
     if not rows:
         return None
     return InlineKeyboardMarkup(inline_keyboard=rows)
