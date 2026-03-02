@@ -2414,7 +2414,14 @@ def setup_http_server():
                 import db as _db_stats
                 if _db_stats.is_enabled():
                     try:
-                        db_users = await _db_stats.get_users_with_purchases(stars_only=False)
+                        # stars_only=False — новые версии db.py; для старых падать не будем
+                        try:
+                            db_users = await _db_stats.get_users_with_purchases(stars_only=False)
+                        except TypeError as te:
+                            if "stars_only" in str(te):
+                                db_users = await _db_stats.get_users_with_purchases()
+                            else:
+                                raise
                         logger.info(f"admin_stats: Loaded {len(db_users)} users from PostgreSQL for merge")
                     except Exception as db_err:
                         logger.warning(f"admin_stats: Failed to load from PostgreSQL: {db_err}")
@@ -5932,7 +5939,14 @@ def setup_http_server():
 
         merchant_id = str(params.get("MERCHANT_ID") or params.get("merchantId") or params.get("merchant_id") or "").strip()
         amount_str = str(params.get("AMOUNT") or params.get("amount") or params.get("sum") or "").strip()
-        merchant_order_id = str(params.get("MERCHANT_ORDER_ID") or params.get("merchantOrderId") or params.get("merchant_order_id") or params.get("paymentId") or params.get("payment_id") or "").strip()
+        merchant_order_id = str(
+            params.get("MERCHANT_ORDER_ID")
+            or params.get("merchantOrderId")
+            or params.get("merchant_order_id")
+            or params.get("paymentId")
+            or params.get("payment_id")
+            or ""
+        ).strip()
         sign_recv = str(params.get("SIGN") or params.get("sign") or params.get("signature") or "").strip().lower()
 
         if not (merchant_id and amount_str and merchant_order_id and sign_recv):
@@ -5956,15 +5970,22 @@ def setup_http_server():
             )
             return web.Response(status=400, text="wrong sign")
 
+        # Ключ, под которым мы сохраняем заказ в памяти/файле (как в create-order и payment_check)
+        import re as _re_notify
+        payment_key = merchant_order_id.lstrip("#").strip()
+        payment_key = _re_notify.sub(r"[^a-zA-Z0-9_-]", "", payment_key)
+        if not payment_key:
+            payment_key = merchant_order_id.lstrip("#").replace("#", "").replace(" ", "").replace("-", "_")
+
         order_meta = None
         try:
             orders_fk = request.app.get("freekassa_orders")
             if isinstance(orders_fk, dict):
-                order_meta = orders_fk.get(str(merchant_order_id))
+                order_meta = orders_fk.get(str(payment_key)) or orders_fk.get(str(merchant_order_id))
             if not order_meta:
-                order_meta = _load_freekassa_order_from_file(str(merchant_order_id))
+                order_meta = _load_freekassa_order_from_file(str(payment_key)) or _load_freekassa_order_from_file(str(merchant_order_id))
                 if order_meta and isinstance(orders_fk, dict):
-                    orders_fk[str(merchant_order_id)] = order_meta
+                    orders_fk[str(payment_key)] = order_meta
         except Exception as e:
             logger.warning("FreeKassa notify: load order failed for %s: %s", merchant_order_id, e)
 
