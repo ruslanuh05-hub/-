@@ -2090,31 +2090,13 @@ async def get_telegram_user_handler(request):
                 }
             )
 
-        # 2) Fallback через Fragment (searchStarsRecipient) — тоже ищет «из всего Telegram»
+        # 2) Fallback через Fragment (searchStarsRecipient) — как в ezstar, использует _fragment_site_post
         # Это даёт поведение "как во Fragment" даже без Telethon.
-        frag_enabled = bool(request.app.get("fragment_site_enabled"))
-        frag_cookie = str(request.app.get("fragment_site_cookies") or "").strip()
-        frag_hash = str(request.app.get("fragment_site_hash") or "").strip()
-        if frag_enabled and frag_cookie and frag_hash:
+        if request.app.get("fragment_site_enabled"):
             try:
                 referer = f"https://fragment.com/stars/buy?recipient={clean_username}&quantity=50"
                 payload = {"query": clean_username, "quantity": "", "method": "searchStarsRecipient"}
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(
-                        "https://fragment.com/api",
-                        params={"hash": frag_hash},
-                        json=payload,
-                        headers={
-                            "content-type": "application/json",
-                            "cookie": frag_cookie,
-                            "referer": referer,
-                            "origin": "https://fragment.com",
-                            "accept": "application/json, text/plain, */*",
-                            "user-agent": "Mozilla/5.0",
-                        },
-                        timeout=aiohttp.ClientTimeout(total=20),
-                    ) as resp:
-                        frag_data = await resp.json(content_type=None) if resp.content_type else {}
+                frag_data = await _fragment_site_post(payload, referer=referer)
                 found = (frag_data or {}).get("found")
                 if isinstance(found, dict) and found.get("recipient"):
                     name = (found.get("name") or found.get("title") or found.get("display_name") or "").strip() or clean_username
@@ -2126,9 +2108,8 @@ async def get_telegram_user_handler(request):
                         or found.get("image")
                         or found.get("image_url")
                     )
-                    # иногда URL может лежать глубже — попробуем вытащить любую ссылку
-                    if not avatar:
-                        avatar = _extract_any_url(found) if "_extract_any_url" in globals() else None
+                    if not avatar and "_extract_any_url" in globals():
+                        avatar = _extract_any_url(found)
                     if isinstance(avatar, str) and avatar.startswith("/"):
                         avatar = "https://fragment.com" + avatar
                     result = {
