@@ -2096,7 +2096,10 @@ async def get_telegram_user_handler(request):
             try:
                 referer = f"https://fragment.com/stars/buy?recipient={clean_username}&quantity=50"
                 payload = {"query": clean_username, "quantity": "", "method": "searchStarsRecipient"}
-                frag_data = await _fragment_site_post(payload, referer=referer)
+                fragment_post = request.app.get("fragment_site_post")
+                if not callable(fragment_post):
+                    raise RuntimeError("fragment_site_post helper is not available in app")
+                frag_data = await fragment_post(payload, referer=referer)
                 found = (frag_data or {}).get("found")
                 if isinstance(found, dict) and found.get("recipient"):
                     name = (found.get("name") or found.get("title") or found.get("display_name") or "").strip() or clean_username
@@ -3809,6 +3812,9 @@ def setup_http_server():
                 if resp.status >= 400:
                     raise RuntimeError(f"fragment.com/api error {resp.status}: {data}")
                 return data if isinstance(data, dict) else {"data": data}
+
+    # Делаем helper доступным из request.app
+    app["fragment_site_post"] = _fragment_site_post
 
     def _fragment_encoded(encoded_string: str) -> str:
         """Декодирование payload из Fragment (как ezstar api/fragment.encoded)."""
