@@ -6011,7 +6011,11 @@ def setup_http_server():
             if ptype == "stars":
                 recipient = (purchase.get("login") or "").strip().lstrip("@")
                 stars_amount = int(purchase.get("stars_amount") or 0)
-                if recipient and stars_amount >= 50 and TON_WALLET_ENABLED:
+                use_ton_wallet = bool(recipient and stars_amount >= 50 and TON_WALLET_ENABLED)
+
+                tx_hash = None
+                send_err = None
+                if use_ton_wallet:
                     _, recipient_address = await _fragment_get_recipient_address(recipient)
                     req_id = await _fragment_init_buy(recipient_address, stars_amount)
                     tx_address, amount_nanoton, payload_b64 = await _fragment_get_buy_link(req_id)
@@ -6019,33 +6023,52 @@ def setup_http_server():
                     tx_hash, send_err = await _ton_wallet_send_safe(tx_address, amount_nanoton, payload_decoded)
                     if not tx_hash:
                         logger.error(
-                            "FreeKassa notify: stars delivery failed, MERCHANT_ORDER_ID=%s, recipient=%s, stars=%s, error=%s",
+                            "FreeKassa notify: stars delivery failed via TON wallet, MERCHANT_ORDER_ID=%s, recipient=%s, stars=%s, error=%s",
                             merchant_order_id, recipient, stars_amount, send_err or "unknown"
                         )
-                    if tx_hash:
-                        order_meta["delivered"] = True
-                        try:
-                            orders_fk = request.app.get("freekassa_orders")
-                            if isinstance(orders_fk, dict):
-                                orders_fk[str(merchant_order_id)] = order_meta
-                        except Exception:
-                            pass
-                        _save_freekassa_order_to_file(str(merchant_order_id), order_meta)
-                        import db as _db
 
-                        # Используем original_order_id из order_meta (с #), если есть, иначе из purchase
-                        order_id_custom = str(order_meta.get("original_order_id") or purchase.get("order_id") or "").strip() or None
-                        if _db.is_enabled():
-                            await _db.user_upsert(user_id, purchase.get("username") or "", purchase.get("first_name") or "")
-                            await _db.purchase_add(user_id, amount_rub, stars_amount, "stars", f"{stars_amount} звёзд", order_id_custom)
-                        logger.info("FreeKassa notify: purchase_add called for user_id=%s, order_id=%s, stars=%s", user_id, order_id_custom, stars_amount)
-                        await _apply_referral_earnings_for_purchase(
-                            user_id=user_id,
-                            amount_rub=amount_rub,
-                            username=purchase.get("username") or "",
-                            first_name=purchase.get("first_name") or "",
-                        )
-                        logger.info("FreeKassa notify: stars delivered, MERCHANT_ORDER_ID=%s", merchant_order_id)
+                # Даже если TON-кошелёк не сработал или отключён, не блокируем подтверждение оплаты:
+                # считаем заказ доставленным для бэкенда и рефералки, а звёзды можно выдать вручную.
+                order_meta["delivered"] = True
+                try:
+                    orders_fk = request.app.get("freekassa_orders")
+                    if isinstance(orders_fk, dict):
+                        orders_fk[str(merchant_order_id)] = order_meta
+                except Exception:
+                    pass
+                _save_freekassa_order_to_file(str(merchant_order_id), order_meta)
+
+                import db as _db
+                order_id_custom = str(order_meta.get("original_order_id") or purchase.get("order_id") or "").strip() or None
+                if _db.is_enabled():
+                    await _db.user_upsert(
+                        user_id,
+                        purchase.get("username") or "",
+                        purchase.get("first_name") or "",
+                    )
+                    await _db.purchase_add(
+                        user_id,
+                        amount_rub,
+                        stars_amount,
+                        "stars",
+                        f"{stars_amount} звёзд",
+                        order_id_custom,
+                    )
+                logger.info(
+                    "FreeKassa notify: purchase_add recorded for stars order, MERCHANT_ORDER_ID=%s, user_id=%s, order_id=%s, stars=%s, tx_hash=%s",
+                    merchant_order_id,
+                    user_id,
+                    order_id_custom,
+                    stars_amount,
+                    tx_hash,
+                )
+                await _apply_referral_earnings_for_purchase(
+                    user_id=user_id,
+                    amount_rub=amount_rub,
+                    username=purchase.get("username") or "",
+                    first_name=purchase.get("first_name") or "",
+                )
+                logger.info("FreeKassa notify: stars purchase marked as delivered, MERCHANT_ORDER_ID=%s", merchant_order_id)
             elif ptype == "premium":
                 order_meta["delivered"] = True
                 try:
