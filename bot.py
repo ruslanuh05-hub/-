@@ -2090,6 +2090,48 @@ async def get_telegram_user_handler(request):
                 }
             )
 
+        # 2) Fallback через Fragment (searchStarsRecipient) — тоже ищет «из всего Telegram»
+        # Это даёт поведение "как во Fragment" даже без Telethon.
+        try:
+            if "FRAGMENT_SITE_ENABLED" in globals() and bool(globals().get("FRAGMENT_SITE_ENABLED")):
+                referer = f"https://fragment.com/stars/buy?recipient={clean_username}&quantity=50"
+                payload = {"query": clean_username, "quantity": "", "method": "searchStarsRecipient"}
+                frag_data = await _fragment_site_post(payload, referer=referer)  # type: ignore[name-defined]
+                found = (frag_data or {}).get("found")
+                if isinstance(found, dict) and found.get("recipient"):
+                    name = (found.get("name") or found.get("title") or found.get("display_name") or "").strip() or clean_username
+                    avatar = (
+                        found.get("photo")
+                        or found.get("photo_url")
+                        or found.get("avatar")
+                        or found.get("avatar_url")
+                        or found.get("image")
+                        or found.get("image_url")
+                    )
+                    if not avatar:
+                        avatar = _extract_any_url(found)  # type: ignore[name-defined]
+                    if isinstance(avatar, str) and avatar.startswith("/"):
+                        avatar = "https://fragment.com" + avatar
+                    result = {
+                        "username": clean_username,
+                        "firstName": name,
+                        "lastName": "",
+                        "avatar": avatar or None,
+                        "source": "fragment",
+                    }
+                    return Response(
+                        text=json.dumps(result, ensure_ascii=False),
+                        content_type="application/json",
+                        charset="utf-8",
+                        headers={
+                            "Access-Control-Allow-Origin": "*",
+                            "Access-Control-Allow-Methods": "GET, OPTIONS",
+                            "Access-Control-Allow-Headers": "*",
+                        },
+                    )
+        except Exception as fe:
+            logger.warning("Fragment searchStarsRecipient lookup failed for %s: %s", clean_username, fe)
+
         # 2) Fallback: Bot API (работает только если пользователь доступен для бота)
         try:
             chat = await bot.get_chat(f'@{clean_username}')
@@ -2099,7 +2141,9 @@ async def get_telegram_user_handler(request):
                 text=json.dumps({
                     'error': 'not_found',
                     'message': 'Пользователь не найден. Убедитесь, что указан верный @username.',
-                    'details': str(e)
+                    'details': str(e),
+                    'telethon_connected': bool(telethon_client is not None),
+                    'fragment_connected': bool(globals().get("FRAGMENT_SITE_ENABLED")),
                 }, ensure_ascii=False),
                 status=404,
                 content_type='application/json',
