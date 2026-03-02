@@ -1821,24 +1821,33 @@ async def _send_notification_preview(message: types.Message, state: FSMContext):
     data = await state.get_data()
     notification_text = data.get("notification_text") or ""
     buttons = data.get("notification_keyboard") or []
-    confirm_keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✅ Да, разослать", callback_data="confirm_notification"),
-                InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_notification"),
-            ]
-        ]
-    )
-    extra = {}
+    # Кнопки подтверждения
+    confirm_row = [
+        InlineKeyboardButton(text="✅ Да, разослать", callback_data="confirm_notification"),
+        InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_notification"),
+    ]
+
+    # Собираем одну общую клавиатуру:
+    # сначала пользовательские кнопки (Канал, Сайт, ...), потом ряд подтверждения
+    inline_keyboard: list[list[InlineKeyboardButton]] = []
     kb_markup = _build_notification_keyboard(buttons)
-    if kb_markup:
-        extra["reply_markup"] = kb_markup
+    if kb_markup and getattr(kb_markup, "inline_keyboard", None):
+        inline_keyboard.extend(kb_markup.inline_keyboard)
+    inline_keyboard.append(confirm_row)
+
+    reply_markup = InlineKeyboardMarkup(inline_keyboard=inline_keyboard)
+
+    # Текст превью: добавляем "..." только если реально обрезали сообщение
+    preview_text = notification_text or ""
+    if len(preview_text) > 200:
+        preview_text = preview_text[:200] + "..."
+
     await message.answer(
         f"📢 <b>Подтверждение отправки:</b>\n\n"
-        f"{notification_text[:200]}...\n\n"
+        f"{preview_text}\n\n"
         f"👥 Будет отправлено: <b>{db.get_users_count()}</b> пользователям",
         parse_mode="HTML",
-        **extra,
+        reply_markup=reply_markup,
     )
 
 
