@@ -1024,6 +1024,7 @@ class AdminStates(StatesGroup):
     waiting_welcome_photo = State()
     waiting_about_text = State()
     waiting_notification_text = State()
+    waiting_notification_keyboard = State()
     waiting_notification_photo = State()
     waiting_user_balance = State()
     waiting_order_id = State()
@@ -1759,35 +1760,122 @@ async def process_admin_order_search(message: types.Message, state: FSMContext):
     await message.answer("\n".join(text_lines), parse_mode="HTML")
     await state.clear()
 
-@dp.message(AdminStates.waiting_notification_text)
-async def process_notification_text(message: types.Message, state: FSMContext):
-    """Обработать текст уведомления"""
-    if not is_admin(message.from_user.id):
-        await message.answer("⛔ Нет прав администратора")
-        await state.clear()
-        return
-    
-    notification_text = message.html_text
-    
-    # Сохраняем текст в состоянии
-    await state.update_data(notification_text=notification_text)
-    
+def _apply_button_color_emoji(text: str, color: str | None) -> str:
+    """Добавляет emoji в начало текста в зависимости от выбранного цвета."""
+    base = (text or "").strip()
+    color = (color or "").lower()
+    if not base:
+        return base
+    # Если текст уже начинается с emoji, ничего не добавляем
+    if base[0] in ("✅", "❌", "⚪", "🔵", "🟢", "🔴"):
+        return base
+    prefix_map = {
+        "green": "✅ ",
+        "success": "✅ ",
+        "red": "❌ ",
+        "danger": "❌ ",
+        "gray": "⚪ ",
+        "grey": "⚪ ",
+        "default": "",
+        "primary": "🔵 ",
+    }
+    prefix = prefix_map.get(color, "")
+    return prefix + base if prefix else base
+
+
+def _build_notification_keyboard(buttons: list[dict] | None) -> InlineKeyboardMarkup | None:
+    """Собирает InlineKeyboardMarkup для рассылки из структуры в состоянии."""
+    if not buttons:
+        return None
+    rows: list[list[InlineKeyboardButton]] = []
+    for item in buttons:
+        if not isinstance(item, dict):
+            continue
+        text = None
+        url = None
+        color = item.get("color")
+        # Поддерживаем два формата:
+        # 1) {"text": "Канал", "url": "https://t.me/...", "color": "green"}
+        # 2) {"Канал": "https://t.me/..."}
+        if "text" in item and "url" in item:
+            text = str(item.get("text") or "").strip()
+            url = str(item.get("url") or "").strip()
+        else:
+            # Берём первую пару ключ‑значение
+            for k, v in item.items():
+                if k and isinstance(v, str):
+                    text = str(k)
+                    url = v
+                    break
+        if not text or not url:
+            continue
+        btn_text = _apply_button_color_emoji(text, color)
+        rows.append([InlineKeyboardButton(text=btn_text, url=url)])
+    if not rows:
+        return None
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _send_notification_preview(message: types.Message, state: FSMContext):
+    """Отправляет превью рассылки с кнопками подтверждения."""
+    data = await state.get_data()
+    notification_text = data.get("notification_text") or ""
+    buttons = data.get("notification_keyboard") or []
     confirm_keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="✅ Отправить всем", callback_data="confirm_notification"),
-                InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_notification")
+                InlineKeyboardButton(text="✅ Да, разослать", callback_data="confirm_notification"),
+                InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_notification"),
             ]
         ]
     )
-    
+    extra = {}
+    kb_markup = _build_notification_keyboard(buttons)
+    if kb_markup:
+        extra["reply_markup"] = kb_markup
     await message.answer(
         f"📢 <b>Подтверждение отправки:</b>\n\n"
         f"{notification_text[:200]}...\n\n"
         f"👥 Будет отправлено: <b>{db.get_users_count()}</b> пользователям",
-        reply_markup=confirm_keyboard,
-        parse_mode="HTML"
+        parse_mode="HTML",
+        **extra,
     )
+
+
+@dp.message(AdminStates.waiting_notification_text)
+async def process_notification_text(message: types.Message, state: FSMContext):
+    """Обработать текст уведомления (этап 1: текст, этап 2: кнопки)."""
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Нет прав администратора")
+        await state.clear()
+        return
+
+    notification_text = message.html_text
+
+    # Сохраняем текст в состоянии
+    await state.update_data(notification_text=notification_text, notification_keyboard=[])
+
+    # Спрашиваем про кнопки как на скриншотах
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="➡ Пропустить", callback_data="notif_kb_skip"),
+                InlineKeyboardButton(text="❌ Отмена", callback_data="notif_kb_cancel"),
+            ]
+        ]
+    )
+
+    await message.answer(
+        "👉 <b>Хотите ли вы добавить клавиатуру?</b>\n\n"
+        "Нажмите ➡ <b>Пропустить</b> или впишите клавиатуру в формате JSON:\n"
+        "<code>[{\"Канал\": \"https://t.me/your_channel\"}, {\"Сайт\": \"https://site.ru\"}]</code>\n\n"
+        "Также поддерживается формат с цветом:\n"
+        "<code>[{\"text\": \"Канал\", \"url\": \"https://t.me/your_channel\", \"color\": \"green\"}]</code>\n"
+        "Доступные цвета: <b>green</b>, <b>red</b>, <b>primary</b>, <b>grey</b>.",
+        parse_mode="HTML",
+        reply_markup=keyboard,
+    )
+    await state.set_state(AdminStates.waiting_notification_keyboard)
 
 @dp.callback_query(F.data == "confirm_notification")
 async def confirm_notification(callback_query: types.CallbackQuery, state: FSMContext):
@@ -1798,6 +1886,7 @@ async def confirm_notification(callback_query: types.CallbackQuery, state: FSMCo
     
     data = await state.get_data()
     notification_text = data.get('notification_text')
+    buttons = data.get("notification_keyboard") or []
     
     if not notification_text:
         await callback_query.answer("❌ Текст уведомления не найден", show_alert=True)
@@ -1810,13 +1899,17 @@ async def confirm_notification(callback_query: types.CallbackQuery, state: FSMCo
     successful = 0
     failed = 0
     
+    # Готовим клавиатуру для рассылки (если задана)
+    broadcast_markup = _build_notification_keyboard(buttons)
+
     # Отправляем уведомления
     for i, user_id in enumerate(users, 1):
         try:
             await bot.send_message(
                 chat_id=user_id,
                 text=notification_text,
-                parse_mode="HTML"
+                parse_mode="HTML",
+                reply_markup=broadcast_markup
             )
             successful += 1
             
@@ -1981,6 +2074,59 @@ async def cancel_notification(callback_query: types.CallbackQuery, state: FSMCon
     await state.clear()
     await callback_query.message.answer("❌ Рассылка отменена")
     await callback_query.answer()
+
+
+@dp.callback_query(F.data == "notif_kb_skip")
+async def notification_keyboard_skip(callback_query: types.CallbackQuery, state: FSMContext):
+    """Админ выбрал пропустить добавление клавиатуры."""
+    if not is_admin(callback_query.from_user.id):
+        await callback_query.answer("⛔ Нет прав администратора", show_alert=True)
+        return
+    await state.update_data(notification_keyboard=[])
+    await _send_notification_preview(callback_query.message, state)
+    await state.set_state(AdminStates.waiting_notification_text)
+    await callback_query.answer()
+
+
+@dp.callback_query(F.data == "notif_kb_cancel")
+async def notification_keyboard_cancel(callback_query: types.CallbackQuery, state: FSMContext):
+    """Отмена рассылки на этапе добавления клавиатуры."""
+    if not is_admin(callback_query.from_user.id):
+        await callback_query.answer("⛔ Нет прав администратора", show_alert=True)
+        return
+    await state.clear()
+    await callback_query.message.answer("❌ Рассылка отменена")
+    await callback_query.answer()
+
+
+@dp.message(AdminStates.waiting_notification_keyboard)
+async def process_notification_keyboard(message: types.Message, state: FSMContext):
+    """Парсинг JSON с кнопками для рассылки."""
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Нет прав администратора")
+        await state.clear()
+        return
+    raw = (message.text or "").strip()
+    try:
+        data = json.loads(raw)
+        if not isinstance(data, list):
+            raise ValueError("Ожидается список кнопок")
+    except Exception as e:
+        await message.answer(
+            "❌ Не удалось разобрать JSON клавиатуры.\n"
+            f"Ошибка: <code>{html.escape(str(e))}</code>\n\n"
+            "Пример:\n"
+            "<code>[{\"Канал\": \"https://t.me/your_channel\"}, {\"Сайт\": \"https://site.ru\"}]</code>\n"
+            "или\n"
+            "<code>[{\"text\": \"Канал\", \"url\": \"https://t.me/your_channel\", \"color\": \"green\"}]</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    # Сохраняем структуру кнопок в состоянии
+    await state.update_data(notification_keyboard=data)
+    await _send_notification_preview(message, state)
+    await state.set_state(AdminStates.waiting_notification_text)
 
 # ============ КОМАНДА /ID ============
 
