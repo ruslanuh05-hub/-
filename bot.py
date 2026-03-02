@@ -2092,11 +2092,29 @@ async def get_telegram_user_handler(request):
 
         # 2) Fallback через Fragment (searchStarsRecipient) — тоже ищет «из всего Telegram»
         # Это даёт поведение "как во Fragment" даже без Telethon.
-        try:
-            if "FRAGMENT_SITE_ENABLED" in globals() and bool(globals().get("FRAGMENT_SITE_ENABLED")):
+        frag_enabled = bool(request.app.get("fragment_site_enabled"))
+        frag_cookie = str(request.app.get("fragment_site_cookies") or "").strip()
+        frag_hash = str(request.app.get("fragment_site_hash") or "").strip()
+        if frag_enabled and frag_cookie and frag_hash:
+            try:
                 referer = f"https://fragment.com/stars/buy?recipient={clean_username}&quantity=50"
                 payload = {"query": clean_username, "quantity": "", "method": "searchStarsRecipient"}
-                frag_data = await _fragment_site_post(payload, referer=referer)  # type: ignore[name-defined]
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        "https://fragment.com/api",
+                        params={"hash": frag_hash},
+                        json=payload,
+                        headers={
+                            "content-type": "application/json",
+                            "cookie": frag_cookie,
+                            "referer": referer,
+                            "origin": "https://fragment.com",
+                            "accept": "application/json, text/plain, */*",
+                            "user-agent": "Mozilla/5.0",
+                        },
+                        timeout=aiohttp.ClientTimeout(total=20),
+                    ) as resp:
+                        frag_data = await resp.json(content_type=None) if resp.content_type else {}
                 found = (frag_data or {}).get("found")
                 if isinstance(found, dict) and found.get("recipient"):
                     name = (found.get("name") or found.get("title") or found.get("display_name") or "").strip() or clean_username
@@ -2108,8 +2126,9 @@ async def get_telegram_user_handler(request):
                         or found.get("image")
                         or found.get("image_url")
                     )
+                    # иногда URL может лежать глубже — попробуем вытащить любую ссылку
                     if not avatar:
-                        avatar = _extract_any_url(found)  # type: ignore[name-defined]
+                        avatar = _extract_any_url(found) if "_extract_any_url" in globals() else None
                     if isinstance(avatar, str) and avatar.startswith("/"):
                         avatar = "https://fragment.com" + avatar
                     result = {
@@ -2129,8 +2148,8 @@ async def get_telegram_user_handler(request):
                             "Access-Control-Allow-Headers": "*",
                         },
                     )
-        except Exception as fe:
-            logger.warning("Fragment searchStarsRecipient lookup failed for %s: %s", clean_username, fe)
+            except Exception as fe:
+                logger.warning("Fragment searchStarsRecipient lookup failed for %s: %s", clean_username, fe)
 
         # 2) Fallback: Bot API (работает только если пользователь доступен для бота)
         try:
@@ -2143,7 +2162,7 @@ async def get_telegram_user_handler(request):
                     'message': 'Пользователь не найден. Убедитесь, что указан верный @username.',
                     'details': str(e),
                     'telethon_connected': bool(telethon_client is not None),
-                    'fragment_connected': bool(globals().get("FRAGMENT_SITE_ENABLED")),
+                    'fragment_connected': bool(request.app.get("fragment_site_enabled")),
                 }, ensure_ascii=False),
                 status=404,
                 content_type='application/json',
@@ -2390,6 +2409,29 @@ def setup_http_server():
     app.router.add_route('OPTIONS', '/api/donatehub/order/{id}', lambda r: Response(status=204, headers=_cors_headers()))
 
     app.router.add_get('/api/telegram/user', get_telegram_user_handler)
+
+    # Debug: проверить Fragment searchStarsRecipient (без Telethon)
+    async def fragment_search_recipient_handler(request):
+        username = _get_username_from_request(request)
+        clean = (username or "").lstrip("@").strip()
+        if not clean:
+            return _json_response({"error": "bad_request", "message": "username is required"}, status=400)
+        if not app.get("fragment_site_enabled"):
+            return _json_response(
+                {"error": "not_configured", "message": "Fragment не настроен (FRAGMENT_COOKIES/FRAGMENT_HASH)"},
+                status=503,
+            )
+        try:
+            referer = f"https://fragment.com/stars/buy?recipient={clean}&quantity=50"
+            payload = {"query": clean, "quantity": "", "method": "searchStarsRecipient"}
+            data = await _fragment_site_post(payload, referer=referer)
+            return _json_response({"ok": True, "data": data})
+        except Exception as e:
+            logger.warning("fragment_search_recipient failed for %s: %s", clean, e)
+            return _json_response({"ok": False, "error": str(e)}, status=502)
+
+    app.router.add_get("/api/fragment/search-recipient", fragment_search_recipient_handler)
+    app.router.add_route("OPTIONS", "/api/fragment/search-recipient", lambda r: Response(status=204, headers=_cors_headers()))
 
     CRYPTOBOT_USDT_AMOUNT = float(os.getenv("CRYPTOBOT_USDT_AMOUNT", "1") or "1")
 
@@ -3709,6 +3751,10 @@ def setup_http_server():
         or str(_fragment_site_cfg.get("hash", "") or "").strip()
     )
     FRAGMENT_SITE_ENABLED = bool(FRAGMENT_SITE_COOKIES and FRAGMENT_SITE_HASH)
+    # Пробрасываем в app, чтобы ими могли пользоваться хендлеры вне этой функции
+    app["fragment_site_enabled"] = FRAGMENT_SITE_ENABLED
+    app["fragment_site_cookies"] = FRAGMENT_SITE_COOKIES
+    app["fragment_site_hash"] = FRAGMENT_SITE_HASH
     # TON-кошелёк бота для отправки TON в Fragment (как в ezstar: бот сам платит Fragment, звёзды приходят получателю).
     TONAPI_KEY = _get_env_clean("TONAPI_KEY") or str(_fragment_site_cfg.get("tonapi_key", "") or "").strip()
     _mnemonic_raw = _get_env_clean("MNEMONIC") or _fragment_site_cfg.get("mnemonic")
