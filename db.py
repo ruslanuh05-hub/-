@@ -270,8 +270,12 @@ async def purchase_add(user_id: str, amount_rub: float, stars_amount: int, ptype
         """, user_id, amount_rub, stars_amount or int(amount_rub / 0.65), ptype or "stars", product_name or "", order_id or None)
 
 
-async def get_users_with_purchases() -> dict:
-    """Все пользователи с покупками (для рейтинга и статистики). user_id -> {username, first_name, registration_date, last_activity, purchases: [...]}"""
+async def get_users_with_purchases(stars_only: bool = True) -> dict:
+    """Все пользователи с покупками.
+
+    По умолчанию возвращает только type='stars' (для рейтинга).
+    Для админ-статистики передавайте stars_only=False, чтобы получить все типы покупок.
+    """
     if not _db_enabled:
         return {}
     async with _pool.acquire() as conn:
@@ -289,14 +293,20 @@ async def get_users_with_purchases() -> dict:
                 "purchases": []
             }
         
-        # Затем получаем покупки. В рейтинг идут ТОЛЬКО покупки звёзд (type = 'stars'),
-        # пополнения баланса и прочие типы здесь игнорируются.
-        purchase_rows = await conn.fetch("""
-            SELECT user_id, amount_rub, stars_amount, type, product_name, created_at
-            FROM purchases
-            WHERE LOWER(type) = 'stars'
-            ORDER BY created_at DESC
-        """)
+        # Для рейтинга берём только stars, для админки — все типы.
+        if stars_only:
+            purchase_rows = await conn.fetch("""
+                SELECT user_id, amount_rub, stars_amount, type, product_name, created_at
+                FROM purchases
+                WHERE LOWER(type) = 'stars'
+                ORDER BY created_at DESC
+            """)
+        else:
+            purchase_rows = await conn.fetch("""
+                SELECT user_id, amount_rub, stars_amount, type, product_name, created_at
+                FROM purchases
+                ORDER BY created_at DESC
+            """)
         
         for pr in purchase_rows:
             uid = pr["user_id"]
