@@ -3674,7 +3674,15 @@ def setup_http_server():
         MNEMONIC = [str(x).strip() for x in _mnemonic_raw if str(x).strip()]
     else:
         MNEMONIC = []
-    TON_WALLET_ENABLED = bool(TONAPI_KEY and len(MNEMONIC) >= 24)
+
+    # Проверяем, доступна ли библиотека tonutils (на некоторых деплоях она может не установиться).
+    try:
+        import tonutils.client as _tu_client  # type: ignore  # noqa: F401
+        _TONUTILS_AVAILABLE = True
+    except Exception:
+        _TONUTILS_AVAILABLE = False
+
+    TON_WALLET_ENABLED = bool(TONAPI_KEY and len(MNEMONIC) >= 24 and _TONUTILS_AVAILABLE)
 
     # Клиент fragment-api-py (для Telegram Premium через Fragment)
     _FRAGMENT_API_CLIENT: Optional["AsyncFragmentAPI"] = None  # type: ignore[valid-type]
@@ -3818,8 +3826,9 @@ def setup_http_server():
 
     async def _ton_wallet_send_safe(address: str, amount_nanoton: int, body_payload: str) -> tuple[Optional[str], Optional[str]]:
         """Возвращает (tx_hash, None) при успехе или (None, error_message) при ошибке."""
-        if not TONAPI_KEY or not MNEMONIC:
-            return (None, "TONAPI_KEY или MNEMONIC не заданы")
+        # Если нет ключей или tonutils недоступен — кошелёк считаем отключённым.
+        if not TON_WALLET_ENABLED:
+            return (None, "TON-кошелёк отключён (нет TONAPI_KEY/MNEMONIC или не установлена библиотека tonutils)")
         try:
             from tonutils.client import TonapiClient
             from tonutils.utils import to_amount
