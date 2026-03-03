@@ -1039,6 +1039,23 @@ def is_admin(user_id: int) -> bool:
     """Проверка прав администратора - ТОЛЬКО из кода"""
     return db.is_admin(user_id)
 
+# Сообщение пользователю при любой ошибке оплаты (реальная ошибка уходит админам в ЛС)
+PAYMENT_ERROR_USER_MESSAGE = "Временная ошибка попробуйте через некоторое время"
+
+async def notify_admins_payment_error(real_error: str, context: str = "") -> None:
+    """Отправляет реальную ошибку оплаты всем админам в личку."""
+    if not ADMIN_IDS or not real_error:
+        return
+    text = "⚠️ <b>Ошибка оплаты</b>"
+    if context:
+        text += f"\nКонтекст: {context}"
+    text += f"\n\nОшибка: {real_error[:2000]}"
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, text, parse_mode="HTML")
+        except Exception as e:
+            logger.warning("Failed to notify admin %s of payment error: %s", admin_id, e)
+
 def get_main_menu(language: str = 'ru'):
     """Главное меню — синие кнопки (primary) для основных действий, красная (danger) для помощи"""
     keyboard = [
@@ -4762,9 +4779,11 @@ def setup_http_server():
             return _json_response({"error": "bad_request", "message": "recipient is required"}, status=400)
 
         if not FRAGMENT_SITE_ENABLED:
+            real_err = "Set FRAGMENT_SITE_COOKIES + FRAGMENT_SITE_HASH (or FRAGMENT_COOKIES + FRAGMENT_HASH)"
+            await notify_admins_payment_error(real_err, "Fragment create-star-order")
             return _json_response({
                 "error": "not_configured",
-                "message": "Set FRAGMENT_SITE_COOKIES + FRAGMENT_SITE_HASH (or FRAGMENT_COOKIES + FRAGMENT_HASH)"
+                "message": PAYMENT_ERROR_USER_MESSAGE
             }, status=503)
         try:
             # ВСЕГДА используем режим fragment.com site: создаём заказ на стороне Fragment
@@ -4781,15 +4800,15 @@ def setup_http_server():
             })
         except Exception as e:
             logger.error(f"Fragment create star order error: {e}")
-            return _json_response({"error": "fragment_site_error", "message": str(e)}, status=502)
+            await notify_admins_payment_error(str(e), "Fragment create-star-order (звёзды)")
+            return _json_response({"error": "fragment_site_error", "message": PAYMENT_ERROR_USER_MESSAGE}, status=502)
 
     async def fragment_create_premium_order_handler(request):
         """Создать заказ на Premium: возвращает order_id и payment_url (если есть), фронт открывает оплату TonKeeper"""
+        real_err = "Premium отключён: оставлен только режим Stars через fragment.com cookies+hash."
+        await notify_admins_payment_error(real_err, "Fragment create-premium-order")
         return _json_response(
-            {
-                "error": "not_supported",
-                "message": "Premium отключён: оставлен только режим Stars через fragment.com cookies+hash.",
-            },
+            {"error": "not_supported", "message": PAYMENT_ERROR_USER_MESSAGE},
             status=501,
         )
 
@@ -4839,11 +4858,10 @@ def setup_http_server():
         - context='deposit'  + amount (RUB) + user_id
         """
         if not CRYPTO_PAY_TOKEN:
+            real_err = "CRYPTO_PAY_TOKEN не задан. Добавьте в переменные окружения Railway/Render."
+            await notify_admins_payment_error(real_err, "CryptoBot create-invoice")
             return _json_response(
-                {
-                    "error": "not_configured",
-                    "message": "CRYPTO_PAY_TOKEN не задан. Добавьте в переменные окружения Railway/Render.",
-                },
+                {"error": "not_configured", "message": PAYMENT_ERROR_USER_MESSAGE},
                 status=503,
             )
 
@@ -5075,9 +5093,11 @@ def setup_http_server():
                     try:
                         data = json.loads(resp_text) if resp_text else {}
                     except json.JSONDecodeError:
+                        real_err = f"Неверный ответ API: {resp_text[:150]}"
+                        await notify_admins_payment_error(real_err, "CryptoBot create-invoice")
                         return _json_response({
                             "error": "cryptobot_error",
-                            "message": f"Неверный ответ API: {resp_text[:150]}"
+                            "message": PAYMENT_ERROR_USER_MESSAGE,
                         }, status=502)
                     if not data.get("ok"):
                         err = data.get("error")
@@ -5086,9 +5106,10 @@ def setup_http_server():
                         else:
                             err_msg = str(err) if err else "Unknown error"
                         logger.error(f"CryptoBot API error: {err_msg}, full={data}")
+                        await notify_admins_payment_error(err_msg, "CryptoBot create-invoice")
                         return _json_response({
                             "error": "cryptobot_error",
-                            "message": err_msg,
+                            "message": PAYMENT_ERROR_USER_MESSAGE,
                             "details": data.get("error")
                         }, status=502)
                     inv = data.get("result", {})
@@ -5137,10 +5158,12 @@ def setup_http_server():
                     })
         except aiohttp.ClientError as e:
             logger.error(f"CryptoBot network error: {e}")
-            return _json_response({"error": "network_error", "message": f"Ошибка связи с Crypto Pay: {e}"}, status=502)
+            await notify_admins_payment_error(f"Ошибка связи с Crypto Pay: {e}", "CryptoBot create-invoice")
+            return _json_response({"error": "network_error", "message": PAYMENT_ERROR_USER_MESSAGE}, status=502)
         except Exception as e:
             logger.error(f"CryptoBot createInvoice error: {e}")
-            return _json_response({"error": "internal_error", "message": str(e)}, status=500)
+            await notify_admins_payment_error(str(e), "CryptoBot create-invoice")
+            return _json_response({"error": "internal_error", "message": PAYMENT_ERROR_USER_MESSAGE}, status=500)
 
     async def cryptobot_check_invoice_handler(request):
         if not CRYPTO_PAY_TOKEN:
@@ -5537,8 +5560,10 @@ def setup_http_server():
     async def platega_create_transaction_handler(request):
         """POST /api/platega/create-transaction — создаёт транзакцию в Platega, возвращает redirect URL."""
         if not PLATEGA_MERCHANT_ID or not PLATEGA_SECRET:
+            real_err = "PLATEGA_MERCHANT_ID и PLATEGA_SECRET не заданы."
+            await notify_admins_payment_error(real_err, "Platega create-transaction")
             return _json_response(
-                {"error": "not_configured", "message": "PLATEGA_MERCHANT_ID и PLATEGA_SECRET не заданы."},
+                {"error": "not_configured", "message": PAYMENT_ERROR_USER_MESSAGE},
                 status=503,
             )
         try:
@@ -5661,7 +5686,9 @@ def setup_http_server():
                         data = json.loads(text) if text else {}
                     except json.JSONDecodeError:
                         logger.warning("Platega create-transaction: response not JSON, status=%s, body=%s", resp.status, text[:300])
-                        return _json_response({"error": "platega_error", "message": f"Ответ не JSON: {text[:200]}"}, status=502)
+                        real_err = f"Ответ не JSON: {text[:200]}"
+                        await notify_admins_payment_error(real_err, "Platega create-transaction")
+                        return _json_response({"error": "platega_error", "message": PAYMENT_ERROR_USER_MESSAGE}, status=502)
                     if resp.status != 200:
                         err = data.get("error") or data.get("message") or data.get("detail") or text[:300]
                         if isinstance(data.get("errors"), dict):
@@ -5669,11 +5696,14 @@ def setup_http_server():
                             if err_parts:
                                 err = "; ".join(str(x) for x in err_parts)
                         logger.warning("Platega create-transaction failed: status=%s, body=%s", resp.status, text[:500])
-                        return _json_response({"error": "platega_error", "message": str(err)}, status=502)
+                        await notify_admins_payment_error(str(err), "Platega create-transaction")
+                        return _json_response({"error": "platega_error", "message": PAYMENT_ERROR_USER_MESSAGE}, status=502)
                     transaction_id = data.get("transactionId") or data.get("transaction_id")
                     redirect_url = data.get("redirect") or data.get("payment_url") or ""
                     if not transaction_id or not redirect_url:
-                        return _json_response({"error": "platega_error", "message": "Нет transactionId или redirect в ответе"}, status=502)
+                        real_err = "Нет transactionId или redirect в ответе"
+                        await notify_admins_payment_error(real_err, "Platega create-transaction")
+                        return _json_response({"error": "platega_error", "message": PAYMENT_ERROR_USER_MESSAGE}, status=502)
                     order_meta = {
                         "context": context,
                         "user_id": user_id,
@@ -5698,10 +5728,12 @@ def setup_http_server():
                     })
         except aiohttp.ClientError as e:
             logger.error("Platega create transaction network error: %s", e)
-            return _json_response({"error": "network_error", "message": str(e)}, status=502)
+            await notify_admins_payment_error(str(e), "Platega create-transaction")
+            return _json_response({"error": "network_error", "message": PAYMENT_ERROR_USER_MESSAGE}, status=502)
         except Exception as e:
             logger.exception("Platega create transaction error: %s", e)
-            return _json_response({"error": "internal_error", "message": str(e)}, status=500)
+            await notify_admins_payment_error(str(e), "Platega create-transaction")
+            return _json_response({"error": "internal_error", "message": PAYMENT_ERROR_USER_MESSAGE}, status=500)
 
     # Platega.io: callback при изменении статуса транзакции
     async def platega_callback_handler(request):
