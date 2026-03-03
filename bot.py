@@ -4211,9 +4211,14 @@ def setup_http_server():
                 order_meta = _load_freekassa_order_from_file(str(payment_id))
                 if order_meta and isinstance(orders_fk, dict):
                     orders_fk[str(payment_id)] = order_meta
-            if order_meta and order_meta.get("delivered"):
-                # Возвращаем оригинальный order_id с # для фронтенда
-                return _json_response({"paid": True, "order_id": order_id_raw, "delivered_by_freekassa": True})
+            if order_meta:
+                # Если заказ уже помечен как доставленный — обычный успешный сценарий
+                if order_meta.get("delivered"):
+                    # Возвращаем оригинальный order_id с # для фронтенда
+                    return _json_response({"paid": True, "order_id": order_id_raw, "delivered_by_freekassa": True})
+                # Если TON не хватило и заказ ждёт выдачи звёзд
+                if order_meta.get("ton_pending"):
+                    return _json_response({"paid": True, "order_id": order_id_raw, "pending_delivery": True})
             return _json_response({"paid": False, "order_id": order_id_raw})
 
         # Platega (карты / СБП): проверка по transaction_id
@@ -6303,6 +6308,16 @@ def setup_http_server():
                             "FreeKassa notify: stars delivery failed via TON wallet, MERCHANT_ORDER_ID=%s, recipient=%s, stars=%s, error=%s",
                             merchant_order_id, recipient, stars_amount, send_err or "unknown"
                         )
+                        # Отмечаем заказ как оплаченный, но ожидающий выдачи звёзд
+                        order_meta["ton_pending"] = True
+                        try:
+                            orders_fk = request.app.get("freekassa_orders")
+                            if isinstance(orders_fk, dict):
+                                orders_fk[str(merchant_order_id)] = order_meta
+                        except Exception:
+                            pass
+                        _save_freekassa_order_to_file(str(merchant_order_id), order_meta)
+
                         # Регистрируем задачу на повторную выдачу и шлём админам спец‑уведомление с кнопкой.
                         retry_id = f"fk:{merchant_order_id}"
                         TON_RETRY_TASKS[retry_id] = {
@@ -6344,7 +6359,8 @@ def setup_http_server():
                         # Не помечаем заказ доставленным — ждём ручной перезапуск.
                         return web.Response(status=200, text="YES")
 
-                # Если TON-кошелёк отключён (use_ton_wallet = False), считаем заказ доставленным только для учёта:
+                # Если TON-кошелёк отключён (use_ton_wallet = False) или отправка прошла успешно,
+                # считаем заказ доставленным только для учёта:
                 order_meta["delivered"] = True
                 try:
                     orders_fk = request.app.get("freekassa_orders")
