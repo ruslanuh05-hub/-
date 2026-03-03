@@ -4219,6 +4219,9 @@ def setup_http_server():
                 # Если TON не хватило и заказ ждёт выдачи звёзд
                 if order_meta.get("ton_pending"):
                     return _json_response({"paid": True, "order_id": order_id_raw, "pending_delivery": True})
+                # Для Premium считаем оплату подтверждённой, даже если выдача ещё не завершена
+                if is_premium:
+                    return _json_response({"paid": True, "order_id": order_id_raw})
             return _json_response({"paid": False, "order_id": order_id_raw})
 
         # Platega (карты / СБП): проверка по transaction_id
@@ -6402,21 +6405,71 @@ def setup_http_server():
                 )
                 logger.info("FreeKassa notify: stars purchase marked as delivered, MERCHANT_ORDER_ID=%s", merchant_order_id)
             elif ptype == "premium":
-                order_meta["delivered"] = True
-                try:
-                    orders_fk = request.app.get("freekassa_orders")
-                    if isinstance(orders_fk, dict):
-                        orders_fk[str(merchant_order_id)] = order_meta
-                except Exception:
-                    pass
-                _save_freekassa_order_to_file(str(merchant_order_id), order_meta)
-                await _apply_referral_earnings_for_purchase(
-                    user_id=user_id,
-                    amount_rub=amount_rub,
-                    username=purchase.get("username") or "",
-                    first_name=purchase.get("first_name") or "",
+                # Автоматическая выдача Telegram Premium через Fragment (как в CryptoBot webhook)
+                recipient = (purchase.get("login") or "").strip().lstrip("@")
+                months = int(purchase.get("months") or 0)
+                logger.info(
+                    "FreeKassa notify: premium purchase detected, MERCHANT_ORDER_ID=%s, recipient=%s, months=%s",
+                    merchant_order_id,
+                    recipient,
+                    months,
                 )
-                logger.info("FreeKassa notify: premium recorded, MERCHANT_ORDER_ID=%s", merchant_order_id)
+
+                delivered_ok = False
+                if recipient and months in (3, 6, 12):
+                    try:
+                        if FRAGMENT_SITE_ENABLED and TON_WALLET_ENABLED:
+                            api = await _get_fragment_api_client()
+                            result = await api.gift_premium(recipient, months, show_sender=False)
+                            if getattr(result, "success", False):
+                                tx_hash = getattr(result, "transaction_hash", None)
+                                logger.info(
+                                    "FreeKassa notify: premium delivered via Fragment, MERCHANT_ORDER_ID=%s, recipient=%s, months=%s, tx=%s",
+                                    merchant_order_id,
+                                    recipient,
+                                    months,
+                                    tx_hash,
+                                )
+                                delivered_ok = True
+                            else:
+                                logger.error(
+                                    "FreeKassa notify: gift_premium failed, MERCHANT_ORDER_ID=%s, recipient=%s, months=%s, error=%s",
+                                    merchant_order_id,
+                                    recipient,
+                                    months,
+                                    getattr(result, "error", None),
+                                )
+                        else:
+                            logger.warning(
+                                "FreeKassa notify: Fragment Premium not configured (FRAGMENT_SITE_ENABLED=%s, TON_WALLET_ENABLED=%s)",
+                                FRAGMENT_SITE_ENABLED,
+                                TON_WALLET_ENABLED,
+                            )
+                    except Exception as e:
+                        logger.exception(
+                            "FreeKassa notify: error delivering premium via Fragment, MERCHANT_ORDER_ID=%s, recipient=%s, months=%s: %s",
+                            merchant_order_id,
+                            recipient,
+                            months,
+                            e,
+                        )
+
+                if delivered_ok:
+                    order_meta["delivered"] = True
+                    try:
+                        orders_fk = request.app.get("freekassa_orders")
+                        if isinstance(orders_fk, dict):
+                            orders_fk[str(merchant_order_id)] = order_meta
+                    except Exception:
+                        pass
+                    _save_freekassa_order_to_file(str(merchant_order_id), order_meta)
+                    await _apply_referral_earnings_for_purchase(
+                        user_id=user_id,
+                        amount_rub=amount_rub,
+                        username=purchase.get("username") or "",
+                        first_name=purchase.get("first_name") or "",
+                    )
+                    logger.info("FreeKassa notify: premium recorded & delivered via Fragment, MERCHANT_ORDER_ID=%s", merchant_order_id)
             elif ptype == "spin":
                 order_meta["delivered"] = True
                 try:
