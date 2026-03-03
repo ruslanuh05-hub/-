@@ -134,6 +134,9 @@ REFERRALS: dict[str, dict] = {}
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REFERRALS_FILE = os.path.join(_SCRIPT_DIR, "referrals_data.json")
 
+# Задачи на повторную отправку звёзд через TON‑кошелёк (retry из админки)
+TON_RETRY_TASKS: dict[str, dict] = {}
+
 # Ключ для шифрования ID в реферальной ссылке (XOR + base62 = короткая ссылка)
 REFERRAL_ENC_KEY = (os.getenv("REFERRAL_ENC_KEY", "jet_ref_2024_secret") or "").encode()[:32].ljust(32, b"0")
 _B62_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -6300,9 +6303,48 @@ def setup_http_server():
                             "FreeKassa notify: stars delivery failed via TON wallet, MERCHANT_ORDER_ID=%s, recipient=%s, stars=%s, error=%s",
                             merchant_order_id, recipient, stars_amount, send_err or "unknown"
                         )
+                        # Регистрируем задачу на повторную выдачу и шлём админам спец‑уведомление с кнопкой.
+                        retry_id = f"fk:{merchant_order_id}"
+                        TON_RETRY_TASKS[retry_id] = {
+                            "source": "freekassa",
+                            "merchant_order_id": merchant_order_id,
+                            "recipient": recipient,
+                            "stars_amount": stars_amount,
+                        }
+                        warning_text = (
+                            "⚠️ Недостаточно TON для выполнения операции.\n\n"
+                            "Для завершения требуется больше TON на кошельке бота.\n\n"
+                            f"Покупка: {stars_amount} ⭐ для @{recipient or '-'}\n"
+                            f"Заказ: {merchant_order_id}\n\n"
+                            "Пожалуйста, пополните баланс и нажмите «Попробовать ещё раз»."
+                        )
+                        kb = InlineKeyboardMarkup(
+                            inline_keyboard=[
+                                [
+                                    InlineKeyboardButton(
+                                        text="🔁 Попробовать ещё раз",
+                                        callback_data=f"retry_ton_fk:{merchant_order_id}",
+                                    )
+                                ]
+                            ]
+                        )
+                        for admin_id in ADMIN_IDS:
+                            try:
+                                await bot.send_message(
+                                    admin_id,
+                                    warning_text,
+                                    reply_markup=kb,
+                                )
+                            except Exception as notify_err:
+                                logger.warning(
+                                    "FreeKassa notify: failed to notify admin %s about TON error: %s",
+                                    admin_id,
+                                    notify_err,
+                                )
+                        # Не помечаем заказ доставленным — ждём ручной перезапуск.
+                        return web.Response(status=200, text="YES")
 
-                # Даже если TON-кошелёк не сработал или отключён, не блокируем подтверждение оплаты:
-                # считаем заказ доставленным для бэкенда и рефералки, а звёзды можно выдать вручную.
+                # Если TON-кошелёк отключён (use_ton_wallet = False), считаем заказ доставленным только для учёта:
                 order_meta["delivered"] = True
                 try:
                     orders_fk = request.app.get("freekassa_orders")
@@ -6453,6 +6495,82 @@ def setup_http_server():
             logger.exception("FreeKassa notify error for MERCHANT_ORDER_ID=%s: %s", merchant_order_id, e)
 
         return web.Response(status=200, text="YES")
+
+    @dp.callback_query(F.data.startswith("retry_ton_fk:"))
+    async def retry_ton_fk_handler(callback_query: types.CallbackQuery):
+        """
+        Кнопка в админке: повторно выдать звёзды через TON‑кошелёк для заказа FreeKassa.
+        Формат callback_data: retry_ton_fk:<MERCHANT_ORDER_ID>
+        """
+        if not is_admin(callback_query.from_user.id):
+            await callback_query.answer("Нет прав", show_alert=True)
+            return
+        try:
+            _, merchant_order_id = callback_query.data.split(":", 1)
+        except Exception:
+            await callback_query.answer("Некорректные данные", show_alert=True)
+            return
+        merchant_order_id = merchant_order_id.strip()
+        retry_id = f"fk:{merchant_order_id}"
+        task = TON_RETRY_TASKS.get(retry_id)
+        if not task:
+            await callback_query.answer("Данные заказа не найдены, попробуйте из лога.", show_alert=True)
+            return
+        recipient = (task.get("recipient") or "").strip().lstrip("@")
+        stars_amount = int(task.get("stars_amount") or 0)
+        if not recipient or stars_amount <= 0:
+            await callback_query.answer("Нет данных для повторной выдачи.", show_alert=True)
+            return
+        if not TON_WALLET_ENABLED:
+            await callback_query.answer("TON‑кошелёк бота отключён.", show_alert=True)
+            return
+        try:
+            _, recipient_address = await _fragment_get_recipient_address(recipient)
+            req_id = await _fragment_init_buy(recipient_address, stars_amount)
+            tx_address, amount_nanoton, payload_b64 = await _fragment_get_buy_link(req_id)
+            payload_decoded = _fragment_encoded(payload_b64)
+            tx_hash, send_err = await _ton_wallet_send_safe(tx_address, amount_nanoton, payload_decoded)
+            if not tx_hash:
+                msg = "TON не хватает, попробуйте ещё раз."
+                kb = InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [
+                            InlineKeyboardButton(
+                                text="🔁 Попробовать ещё раз",
+                                callback_data=f"retry_ton_fk:{merchant_order_id}",
+                            )
+                        ]
+                    ]
+                )
+                try:
+                    await callback_query.message.edit_text(
+                        msg
+                        + f"\n\nПокупка: {stars_amount} ⭐ для @{recipient or '-'}\nЗаказ: {merchant_order_id}",
+                        reply_markup=kb,
+                    )
+                except Exception:
+                    await callback_query.message.answer(
+                        msg
+                        + f"\n\nПокупка: {stars_amount} ⭐ для @{recipient or '-'}\nЗаказ: {merchant_order_id}",
+                        reply_markup=kb,
+                    )
+                await callback_query.answer("TON всё ещё не хватает.", show_alert=True)
+                return
+            # Успех: помечаем заказ доставленным и обновляем сообщение администратору
+            msg_ok = (
+                f"✅ Успешная оплата, звёзды выданы.\n\n"
+                f"Покупка: {stars_amount} ⭐ для @{recipient or '-'}\n"
+                f"Заказ: {merchant_order_id}\n"
+                f"Tx: {tx_hash}"
+            )
+            try:
+                await callback_query.message.edit_text(msg_ok)
+            except Exception:
+                await callback_query.message.answer(msg_ok)
+            await callback_query.answer("Повторная выдача выполнена.", show_alert=False)
+        except Exception as e:
+            logger.exception("retry_ton_fk_handler error for %s: %s", merchant_order_id, e)
+            await callback_query.answer("Ошибка при повторной выдаче. Смотрите логи.", show_alert=True)
 
     app.router.add_post("/api/cryptobot/create-invoice", cryptobot_create_invoice_handler)
     app.router.add_route("OPTIONS", "/api/cryptobot/create-invoice", lambda r: Response(status=204, headers=_cors_headers()))
