@@ -1761,26 +1761,12 @@ async def process_admin_order_search(message: types.Message, state: FSMContext):
     await state.clear()
 
 def _apply_button_color_emoji(text: str, color: str | None) -> str:
-    """Добавляет emoji в начало текста в зависимости от выбранного цвета."""
+    """Возвращает текст кнопки без добавления emoji (цвет задаётся только стилем)."""
     base = (text or "").strip()
     color = (color or "").lower()
     if not base:
         return base
-    # Если текст уже начинается с emoji, ничего не добавляем
-    if base[0] in ("✅", "❌", "⚪", "🔵", "🟢", "🔴"):
-        return base
-    prefix_map = {
-        "green": "✅ ",
-        "success": "✅ ",
-        "red": "❌ ",
-        "danger": "❌ ",
-        "gray": "⚪ ",
-        "grey": "⚪ ",
-        "default": "",
-        "primary": "🔵 ",
-    }
-    prefix = prefix_map.get(color, "")
-    return prefix + base if prefix else base
+    return base
 
 
 def _build_notification_keyboard(buttons: list[dict] | None) -> InlineKeyboardMarkup | None:
