@@ -5356,6 +5356,17 @@ def setup_http_server():
                                         logger.exception(f"CryptoBot webhook: error recording stars purchase for invoice_id={invoice_id}: {record_err}")
                                 else:
                                     logger.error(f"CryptoBot webhook: failed to deliver stars, invoice_id={invoice_id}, error={send_err}")
+                                    # Уведомляем админов, если TON не хватает или есть другая ошибка выдачи
+                                    try:
+                                        err_text = (
+                                            f"Ошибка выдачи звёзд через TON-кошелёк (CryptoBot webhook).\n"
+                                            f"invoice_id={invoice_id}, user_id={user_id}, "
+                                            f"получатель=@{(purchase.get('login') or '').strip().lstrip('@') or '-'}, "
+                                            f"звёзд={stars_amount}, ошибка={send_err or 'unknown'}"
+                                        )
+                                        await notify_admins_payment_error(err_text, "CryptoBot stars TON wallet")
+                                    except Exception as notify_err:
+                                        logger.warning("CryptoBot webhook: failed to notify admins about TON error: %s", notify_err)
                         except Exception as e:
                             logger.exception(f"CryptoBot webhook: error delivering stars for invoice_id={invoice_id}: {e}")
                 
