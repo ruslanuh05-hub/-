@@ -376,7 +376,7 @@ async def rates_get() -> dict:
 
 
 async def rates_set(key: str, value: float):
-    """Установить курс. key: star_price_rub, star_buy_rate_rub, steam_rate_rub, premium_3, premium_6, premium_12."""
+    """Установить курс. key: star_price_rub, star_buy_rate_rub, steam_rate_rub, ton_rate_rub, premium_3, premium_6, premium_12 и др."""
     if not _db_enabled:
         logger.warning(f"rates_set: DB not enabled, cannot save {key}={value}")
         return

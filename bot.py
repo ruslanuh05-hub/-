@@ -3048,18 +3048,47 @@ def setup_http_server():
     app.router.add_route('OPTIONS', '/api/idea/submit', lambda r: Response(status=204, headers=_cors_headers()))
 
     async def ton_rate_handler(request):
-        """Курс TON→RUB через CoinPaprika (прокси для обхода CORS в Telegram WebView)."""
+        """Курс TON→RUB через CoinPaprika (прокси для обхода CORS в Telegram WebView).
+
+        Всегда стараемся брать актуальный курс из базы, а при обновлении из CoinPaprika — сохраняем ton_rate_rub в БД.
+        """
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get("https://api.coinpaprika.com/v1/tickers/ton-toncoin?quotes=RUB") as resp:
-                    data = await resp.json(content_type=None) if resp.content_type else {}
-            rub_price = None
-            if data and data.get("quotes") and data["quotes"].get("RUB"):
-                rub_price = float(data["quotes"]["RUB"].get("price", 0) or 0)
-            if not rub_price or rub_price <= 0:
-                return _json_response({"TON": 600, "RUB_TON": 1 / 600})
-            rub_ton = 1 / rub_price
-            return _json_response({"TON": round(rub_price, 2), "RUB_TON": round(rub_ton, 8)})
+            rate = None
+            # 1) Пытаемся взять курс из БД
+            try:
+                import db as _db_rates
+                if _db_rates.is_enabled():
+                    rates = await _db_rates.rates_get()
+                    db_rate = float(rates.get("ton_rate_rub") or 0)
+                    if db_rate > 0:
+                        rate = round(db_rate, 2)
+                        logger.debug(f"ton-rate GET: using ton_rate_rub from DB = {rate}")
+            except Exception as e_db:
+                logger.warning(f"ton-rate DB read error: {e_db}")
+
+            # 2) Если в БД нет — обновляем из CoinPaprika и сохраняем
+            if rate is None:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get("https://api.coinpaprika.com/v1/tickers/ton-toncoin?quotes=RUB") as resp:
+                        data = await resp.json(content_type=None) if resp.content_type else {}
+                if data and data.get("quotes") and data["quotes"].get("RUB"):
+                    rub_price = float(data["quotes"]["RUB"].get("price", 0) or 0)
+                    if rub_price > 0:
+                        rate = round(rub_price, 2)
+                        # Пишем курс в БД (best-effort)
+                        try:
+                            import db as _db_rates_save
+                            if _db_rates_save.is_enabled():
+                                await _db_rates_save.rates_set("ton_rate_rub", rate)
+                                logger.info(f"✓ Saved ton_rate_rub={rate} to DB from CoinPaprika")
+                        except Exception as e_save:
+                            logger.warning(f"ton-rate DB save error: {e_save}")
+
+            if not rate or rate <= 0:
+                rate = 600.0
+
+            rub_ton = 1.0 / rate
+            return _json_response({"TON": rate, "RUB_TON": round(rub_ton, 8)})
         except Exception as e:
             logger.warning(f"TON rate fetch error: {e}")
             return _json_response({"TON": 600, "RUB_TON": 1 / 600})
@@ -3261,6 +3290,27 @@ def setup_http_server():
     TON_PAYMENT_ADDRESS = {"value": (os.getenv("TON_PAYMENT_ADDRESS") or "").strip()}
 
     async def _get_ton_rate_rub() -> float:
+        """
+        Получить курс TON→RUB.
+
+        Логика:
+        1) Пытаемся взять ton_rate_rub из PostgreSQL (таблица app_rates).
+        2) Если нет или невалидный — запрашиваем CoinPaprika, сохраняем в БД и возвращаем.
+        3) В случае любой ошибки — возвращаем 600.0.
+        """
+        # 1) Пробуем БД
+        try:
+            import db as _db_rates
+            if _db_rates.is_enabled():
+                rates = await _db_rates.rates_get()
+                db_rate = float(rates.get("ton_rate_rub") or 0)
+                if db_rate > 0:
+                    logger.debug(f"_get_ton_rate_rub: using DB ton_rate_rub={db_rate}")
+                    return round(db_rate, 2)
+        except Exception as e_db:
+            logger.warning(f"_get_ton_rate_rub DB error: {e_db}")
+
+        # 2) Фолбек: берём с CoinPaprika и сохраняем
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get("https://api.coinpaprika.com/v1/tickers/ton-toncoin?quotes=RUB") as resp:
@@ -3268,7 +3318,15 @@ def setup_http_server():
             if data and data.get("quotes") and data["quotes"].get("RUB"):
                 p = float(data["quotes"]["RUB"].get("price", 0) or 0)
                 if p > 0:
-                    return round(p, 2)
+                    rate = round(p, 2)
+                    try:
+                        import db as _db_rates_save
+                        if _db_rates_save.is_enabled():
+                            await _db_rates_save.rates_set("ton_rate_rub", rate)
+                            logger.info(f"_get_ton_rate_rub: saved ton_rate_rub={rate} to DB")
+                    except Exception as e_save:
+                        logger.warning(f"_get_ton_rate_rub save error: {e_save}")
+                    return rate
         except Exception as e:
             logger.warning(f"TON rate for create-order: {e}")
         return 600.0
