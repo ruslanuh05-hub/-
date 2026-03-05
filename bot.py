@@ -486,7 +486,11 @@ async def _get_or_create_ref_user(user_id: int | str) -> dict:
             "referrals_l1": [],
             "referrals_l2": [],
             "referrals_l3": [],
+            # ref_balance_rub — текущий реферальный баланс (доступен к выводу/конвертации)
             "earned_rub": 0.0,
+            # total_earned_rub — суммарно начислено за всё время (для «Заработано»)
+            "total_earned_rub": 0.0,
+            # volume_rub — объём покупок рефералов (для уровней)
             "volume_rub": 0.0,
         }
     return REFERRALS[uid]
@@ -549,14 +553,14 @@ async def _apply_referral_earnings_for_purchase(
             return 0.07  # максимум 7%
 
     # Начисляем только на parent1, parent2, parent3 — одинаковый процент для всех.
-    # Награда сразу зачисляется на RUB-баланс родителя.
+    # ВАЖНО: реферальные деньги НЕ зачисляются на баланс, а копятся в earned_rub.
     parents = [user_ref.get("parent1"), user_ref.get("parent2"), user_ref.get("parent3")]
     any_parent = False
     for pid in parents:
         if not pid:
             continue
         any_parent = True
-        pref = await _get_or_create_ref_user(pid)
+    pref = await _get_or_create_ref_user(pid)
         # Обновляем объём parent'а
         pref["volume_rub"] = float(pref.get("volume_rub") or 0.0) + amount
         # Определяем процент по **новому** объёму parent'а
@@ -566,13 +570,8 @@ async def _apply_referral_earnings_for_purchase(
         if bonus <= 0:
             continue
         pref["earned_rub"] = float(pref.get("earned_rub") or 0.0) + bonus
-        # Мгновенно зачисляем на баланс родителя (если доступна БД)
-        try:
-            import db as _db_ref
-            if _db_ref.is_enabled():
-                await _db_ref.balance_add_rub(str(pid), bonus)
-        except Exception as e:
-            logger.warning("apply_referral_earnings: failed to credit balance for parent %s: %s", pid, e)
+        pref["total_earned_rub"] = float(pref.get("total_earned_rub") or 0.0) + bonus
+        # Баланс больше не используем (скрыт); начисление только в реферальный остаток.
 
     if not any_parent:
         logger.info("apply_referral_earnings: у пользователя %s нет parent1/2/3, начислять некому", uid)
@@ -3429,11 +3428,23 @@ def setup_http_server():
 
     # ======== РЕФЕРАЛЬНАЯ СИСТЕМА (API) ========
 
+    def _require_tg_user_id(request: web.Request) -> Optional[str]:
+        """Возвращает user_id из валидного Telegram init_data, иначе None."""
+        init_data = (request.headers.get("X-Telegram-Init-Data") or request.query.get("init_data") or "").strip()
+        uid = _validate_telegram_init_data(init_data)
+        return uid
+
     async def referral_purchase_handler(request):
         """
         Начисление реферального дохода с покупки пользователя.
         JSON: { "user_id": "...", "amount_rub": 123.45 }
         """
+        # Этот эндпоинт не должен быть публичным: иначе можно накрутить реф.баланс.
+        token = (os.getenv("REFERRAL_PURCHASE_TOKEN") or "").strip()
+        if not token:
+            return _json_response({"error": "disabled", "message": "endpoint disabled"}, status=410)
+        if (request.headers.get("X-Internal-Token") or "").strip() != token:
+            return _json_response({"error": "forbidden", "message": "forbidden"}, status=403)
         try:
             body = await request.json()
         except Exception:
@@ -3487,13 +3498,9 @@ def setup_http_server():
         В новой логике вся реферальная награда сразу зачисляется на баланс в рублях.
         Здесь возвращаем только статистику в RUB (без TON).
         """
-        user_id = request.rel_url.query.get("user_id", "").strip()
-        if not user_id:
-            return _json_response({"error": "bad_request", "message": "user_id required"}, status=400)
-        try:
-            uid = str(int(user_id))
-        except Exception:
-            uid = str(user_id)
+        uid = _require_tg_user_id(request)
+        if not uid:
+            return _json_response({"error": "unauthorized", "message": "Некорректные или устаревшие данные Telegram"}, status=401)
 
         await _load_referrals()
         ref = await _get_or_create_ref_user(uid)
@@ -3505,10 +3512,12 @@ def setup_http_server():
         total_refs = lvl1 + lvl2 + lvl3
 
         earned_rub = float(ref.get("earned_rub") or 0.0)
+        total_earned_rub = float(ref.get("total_earned_rub") or earned_rub or 0.0)
         volume_rub = float(ref.get("volume_rub") or 0.0)
         payload = {
             "user_id": uid,
             "earned_rub": round(earned_rub, 2),
+            "total_earned_rub": round(total_earned_rub, 2),
             "volume_rub": round(volume_rub, 2),
             "referrals_level1": lvl1,
             "referrals_level2": lvl2,
@@ -3525,12 +3534,12 @@ def setup_http_server():
         Реферальная ссылка с зашифрованным ID.
         GET /api/referral/link?user_id=...
         """
-        user_id = request.rel_url.query.get("user_id", "").strip()
-        if not user_id:
-            return _json_response({"error": "bad_request", "message": "user_id required"}, status=400)
+        uid_str = _require_tg_user_id(request)
+        if not uid_str:
+            return _json_response({"error": "unauthorized", "message": "Некорректные или устаревшие данные Telegram"}, status=401)
         try:
-            uid = int(user_id)
-        except (ValueError, TypeError):
+            uid = int(uid_str)
+        except Exception:
             return _json_response({"error": "bad_request", "message": "user_id must be integer"}, status=400)
         try:
             me = await bot.get_me()
@@ -3554,7 +3563,10 @@ def setup_http_server():
         except Exception:
             return _json_response({"error": "bad_request", "message": "Invalid JSON"}, status=400)
 
-        user_id = body.get("user_id")
+        uid_from_tg = _require_tg_user_id(request)
+        if not uid_from_tg:
+            return _json_response({"error": "unauthorized", "message": "Некорректные или устаревшие данные Telegram"}, status=401)
+        user_id = uid_from_tg
         amount_rub = body.get("amount_rub") or body.get("amount")
         method = (body.get("method") or "").strip()
         details = (body.get("details") or "").strip()
@@ -3632,6 +3644,110 @@ def setup_http_server():
 
     app.router.add_post("/api/referral/withdraw", referral_withdraw_handler)
     app.router.add_route("OPTIONS", "/api/referral/withdraw", lambda r: Response(status=204, headers=_cors_headers()))
+
+    async def referral_withdraw_stars_handler(request):
+        """
+        Вывод реферального заработка в Telegram Stars.
+        JSON: { "user_id": "...", "stars_amount": 150, "recipient": "@username" }
+        Минимум: 150 ⭐
+        Списание: из earned_rub (реферальный остаток)
+        Выдача: через Fragment (TON‑кошелёк бота), как при покупке звёзд.
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            return _json_response({"error": "bad_request", "message": "Invalid JSON"}, status=400)
+
+        uid_from_tg = _require_tg_user_id(request)
+        if not uid_from_tg:
+            return _json_response({"error": "unauthorized", "message": "Некорректные или устаревшие данные Telegram"}, status=401)
+        user_id = uid_from_tg
+        stars_amount_raw = body.get("stars_amount") or body.get("starsAmount") or body.get("amount")
+        recipient = (body.get("recipient") or body.get("login") or body.get("username") or "").strip().lstrip("@")
+
+        try:
+            uid = str(int(str(user_id).strip()))
+            stars_amount = int(stars_amount_raw or 0)
+        except Exception:
+            return _json_response({"error": "bad_request", "message": "stars_amount(int) обязателен"}, status=400)
+
+        if not recipient:
+            return _json_response({"error": "bad_request", "message": "recipient обязателен"}, status=400)
+
+        if stars_amount < 150:
+            return _json_response({"error": "too_small", "message": "Минимальный вывод 150 звёзд"}, status=400)
+
+        if stars_amount > VALIDATION_LIMITS["stars_max"]:
+            return _json_response({"error": "too_large", "message": f"Максимум {VALIDATION_LIMITS['stars_max']} звёзд"}, status=400)
+
+        if not (FRAGMENT_SITE_ENABLED and TON_WALLET_ENABLED):
+            await notify_admins_payment_error("Fragment/TON wallet not configured for referral withdraw stars", "Referral withdraw stars")
+            return _json_response({"error": "not_configured", "message": "Временная ошибка попробуйте через некоторое время"}, status=503)
+
+        # Стоимость в рублях: конвертация по текущей цене звезды (как покупка звёзд)
+        cost_rub = round(float(stars_amount) * float(_get_star_price_rub()), 2)
+
+        await _load_referrals()
+        ref = await _get_or_create_ref_user(uid)
+        current_balance = float(ref.get("earned_rub") or 0.0)
+        if cost_rub > current_balance + 1e-6:
+            # «Человеческое» сообщение: сколько доступно и сколько нужно
+            needed_diff = cost_rub - current_balance
+            needed_stars = int(round(needed_diff / max(_get_star_price_rub(), 0.01)))
+            return _json_response(
+                {
+                    "error": "insufficient_funds",
+                    "message": (
+                        "Недостаточно средств на реферальном балансе. "
+                        f"Доступно: {round(current_balance, 2):.2f} ₽, требуется: {cost_rub:.2f} ₽ "
+                        f"(ещё примерно {max(needed_stars, 1)} ⭐)."
+                    ),
+                    "current_balance_rub": round(current_balance, 2),
+                    "required_rub": cost_rub,
+                },
+                status=400,
+            )
+
+        # Пытаемся выдать звёзды через Fragment (TON‑кошелёк бота)
+        try:
+            _, recipient_address = await _fragment_get_recipient_address(recipient)
+            req_id = await _fragment_init_buy(recipient_address, stars_amount)
+            tx_address, amount_nanoton, payload_b64 = await _fragment_get_buy_link(req_id)
+            payload_decoded = _fragment_encoded(payload_b64)
+            tx_hash, send_err = await _ton_wallet_send_safe(tx_address, amount_nanoton, payload_decoded)
+            if not tx_hash:
+                # Не списываем рубли, просто уведомляем админов
+                await notify_admins_payment_error(
+                    f"Недостаточно TON / ошибка выдачи реф.звёзд: user_id={uid}, recipient=@{recipient}, stars={stars_amount}, error={send_err or 'unknown'}",
+                    "Referral withdraw stars",
+                )
+                return _json_response(
+                    {"error": "ton_insufficient", "message": "Временная ошибка попробуйте через некоторое время"},
+                    status=502,
+                )
+        except Exception as e:
+            await notify_admins_payment_error(
+                f"Ошибка выдачи реф.звёзд: user_id={uid}, recipient=@{recipient}, stars={stars_amount}, error={e}",
+                "Referral withdraw stars",
+            )
+            return _json_response({"error": "internal_error", "message": "Временная ошибка попробуйте через некоторое время"}, status=500)
+
+        # Списание после успешной отправки
+        ref["earned_rub"] = round(current_balance - cost_rub, 2)
+        await _save_referrals()
+
+        return _json_response(
+            {
+                "success": True,
+                "stars_amount": stars_amount,
+                "recipient": recipient,
+                "spent_rub": cost_rub,
+                "new_balance_rub": round(ref["earned_rub"], 2),
+            }
+        )
+
+    app.router.add_post("/api/referral/withdraw-stars", referral_withdraw_stars_handler)
+    app.router.add_route("OPTIONS", "/api/referral/withdraw-stars", lambda r: Response(status=204, headers=_cors_headers()))
 
     # Продажа звёзд из мини-приложения: создать счёт XTR и сохранить данные выплаты
     async def sellstars_create_invoice_handler(request):
