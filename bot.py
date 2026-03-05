@@ -1062,13 +1062,13 @@ def get_main_menu(language: str = 'ru'):
     """Главное меню — синие кнопки (primary) для основных действий, красная (danger) для помощи"""
     keyboard = [
         [
-            InlineKeyboardButton(text="🚀 Открыть приложение", web_app=WebAppInfo(url=WEB_APP_URL), style="primary"),
+            InlineKeyboardButton(text="🚀 Открыть приложение", web_app=WebAppInfo(url=WEB_APP_URL)),
         ],
         [
-            InlineKeyboardButton(text="📰 Подписаться на канал", url="https://t.me/JetStoreApp", style="primary"),
+            InlineKeyboardButton(text="📰 Подписаться на канал", url="https://t.me/JetStoreApp"),
         ],
         [
-            InlineKeyboardButton(text="? Помощь", callback_data="help_info", style="danger"),
+            InlineKeyboardButton(text="? Помощь", callback_data="help_info"),
         ]
     ]
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
@@ -1077,20 +1077,20 @@ def get_about_menu(language: str = 'ru'):
     """Меню 'О нас' (только русский текст)"""
     keyboard = [
         [
-            InlineKeyboardButton(text="📞 Помощь", url="https://t.me/L3ZTADM", style="primary"),
-            InlineKeyboardButton(text="📢 Наш канал", url="https://t.me/JetStoreApp", style="primary")
+            InlineKeyboardButton(text="📞 Помощь", url="https://t.me/L3ZTADM"),
+            InlineKeyboardButton(text="📢 Наш канал", url="https://t.me/JetStoreApp")
         ],
         [
             InlineKeyboardButton(text="📄 Договор оферты",
-                                url="https://telegra.ph/Dogovor-Oferty-02-11-4", style="primary"),
+                                url="https://telegra.ph/Dogovor-Oferty-02-11-4"),
         ],
         [
             InlineKeyboardButton(text="📜 Пользовательское соглашение",
-                                url="https://telegra.ph/Polzovatelskoe-soglashenie-02-11-33", style="primary"),
+                                url="https://telegra.ph/Polzovatelskoe-soglashenie-02-11-33"),
         ],
         [
             InlineKeyboardButton(text="🔒 Политика конфиденциальности",
-                                url="https://telegra.ph/Politika-konfidecialnosti-02-11", style="primary"),
+                                url="https://telegra.ph/Politika-konfidecialnosti-02-11"),
         ],
         [
             InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")
@@ -3254,11 +3254,42 @@ def setup_http_server():
                     pass
             if updated:
                 _save_app_rates_to_file()
+            # После POST сразу отдаём актуальные значения (с учётом возможного сохранения в БД)
+            try:
+                import db as _db_rates
+                if _db_rates.is_enabled():
+                    rates = await _db_rates.rates_get()
+                    sp = rates.get("star_price_rub")
+                    sb = rates.get("star_buy_rate_rub")
+                    star_price = float(sp) if sp is not None and float(sp) > 0 else _get_star_price_rub()
+                    star_buy = float(sb) if sb is not None and float(sb) > 0 else _get_star_buy_rate_rub()
+                    return _json_response({
+                        "star_price_rub": star_price,
+                        "star_buy_rate_rub": star_buy,
+                    })
+            except Exception as e:
+                logger.warning("star_rate POST/db sync error: %s", e)
             return _json_response({
                 "star_price_rub": _get_star_price_rub(),
                 "star_buy_rate_rub": _get_star_buy_rate_rub(),
             })
+        # GET: всегда пробуем взять свежие курсы из БД, если PostgreSQL включён
         try:
+            try:
+                import db as _db_rates
+                if _db_rates.is_enabled():
+                    rates = await _db_rates.rates_get()
+                    sp = rates.get("star_price_rub")
+                    sb = rates.get("star_buy_rate_rub")
+                    star_price = float(sp) if sp is not None and float(sp) > 0 else _get_star_price_rub()
+                    star_buy = float(sb) if sb is not None and float(sb) > 0 else _get_star_buy_rate_rub()
+                    return _json_response({
+                        "star_price_rub": star_price,
+                        "star_buy_rate_rub": star_buy,
+                    })
+            except Exception as e_db:
+                logger.warning("star_rate GET/db error: %s", e_db)
+            # Фолбек: только env/файл
             return _json_response({
                 "star_price_rub": _get_star_price_rub(),
                 "star_buy_rate_rub": _get_star_buy_rate_rub(),
