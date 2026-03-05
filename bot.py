@@ -560,7 +560,7 @@ async def _apply_referral_earnings_for_purchase(
         if not pid:
             continue
         any_parent = True
-    pref = await _get_or_create_ref_user(pid)
+        pref = await _get_or_create_ref_user(pid)
         # Обновляем объём parent'а
         pref["volume_rub"] = float(pref.get("volume_rub") or 0.0) + amount
         # Определяем процент по **новому** объёму parent'а
