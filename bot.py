@@ -2557,6 +2557,64 @@ def setup_http_server():
 
     _load_app_rates_from_file()
 
+    async def _sync_app_rates_from_db_on_startup(app_: web.Application):
+        """
+        При старте бота подтягиваем курсы из PostgreSQL (таблица app_rates)
+        и записываем их в оверрайды + файл, чтобы значения из админки
+        не сбрасывались после перезапуска.
+        """
+        try:
+            import db as _db_rates
+            if not _db_rates.is_enabled():
+                logger.info("App rates DB not enabled, skip app_rates sync on startup")
+                return
+
+            rates = await _db_rates.rates_get()
+            if not rates:
+                logger.info("App rates DB is empty, nothing to sync on startup")
+                return
+
+            global _star_price_rub_override, _star_buy_rate_rub_override, _steam_rate_rub_override
+
+            v = rates.get("star_price_rub")
+            if v is not None:
+                try:
+                    fv = float(v)
+                    if fv > 0:
+                        _star_price_rub_override = fv
+                except (TypeError, ValueError):
+                    pass
+
+            v = rates.get("star_buy_rate_rub")
+            if v is not None:
+                try:
+                    fv = float(v)
+                    if fv > 0:
+                        _star_buy_rate_rub_override = fv
+                except (TypeError, ValueError):
+                    pass
+
+            v = rates.get("steam_rate_rub")
+            if v is not None:
+                try:
+                    fv = float(v)
+                    if fv > 0:
+                        _steam_rate_rub_override = fv
+                except (TypeError, ValueError):
+                    pass
+
+            _save_app_rates_to_file()
+            logger.info(
+                "Synced app rates from DB on startup: star_price_rub=%s, star_buy_rate_rub=%s, steam_rate_rub=%s",
+                _star_price_rub_override,
+                _star_buy_rate_rub_override,
+                _steam_rate_rub_override,
+            )
+        except Exception as e:
+            logger.warning("_sync_app_rates_from_db_on_startup error: %s", e, exc_info=True)
+
+    app.on_startup.append(_sync_app_rates_from_db_on_startup)
+
     # Preflight для CORS
     app.router.add_route('OPTIONS', '/api/telegram/user', lambda r: Response(status=204, headers={
         'Access-Control-Allow-Origin': '*',
