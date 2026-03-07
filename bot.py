@@ -6977,8 +6977,32 @@ def setup_http_server():
                         # Не помечаем заказ доставленным — ждём ручной перезапуск.
                         return web.Response(status=200, text="YES")
 
-                # Если TON-кошелёк отключён (use_ton_wallet = False) или отправка прошла успешно,
-                # считаем заказ доставленным только для учёта:
+                # Если use_ton_wallet=False (TON выключен или recipient/stars некорректны) —
+                # звёзды не отправлены, не помечаем delivered.
+                if not use_ton_wallet:
+                    order_meta["ton_pending"] = True
+                    try:
+                        orders_fk = request.app.get("freekassa_orders")
+                        if isinstance(orders_fk, dict):
+                            orders_fk[str(merchant_order_id)] = order_meta
+                    except Exception:
+                        pass
+                    _save_freekassa_order_to_file(str(merchant_order_id), order_meta)
+                    reason = "TON-кошелёк отключён" if not TON_WALLET_ENABLED else ("нет получателя" if not recipient else f"звёзд < 50 ({stars_amount})")
+                    for admin_id in ADMIN_IDS:
+                        try:
+                            await bot.send_message(
+                                admin_id,
+                                f"⚠️ Оплата звёзд получена, но выдача не выполнена ({reason}).\n\n"
+                                f"Заказ: {merchant_order_id}\nПолучатель: @{recipient or '-'}\nЗвёзд: {stars_amount}\n\n"
+                                "Настройте TON-кошелёк или выдайте звёзды вручную.",
+                            )
+                        except Exception as e:
+                            logger.warning("FreeKassa notify: failed to notify admin about TON disabled: %s", e)
+                    logger.warning("FreeKassa notify: stars order NOT delivered (use_ton_wallet=False), MERCHANT_ORDER_ID=%s", merchant_order_id)
+                    return web.Response(status=200, text="YES")
+
+                # Отправка прошла успешно (tx_hash есть):
                 order_meta["delivered"] = True
                 try:
                     orders_fk = request.app.get("freekassa_orders")
