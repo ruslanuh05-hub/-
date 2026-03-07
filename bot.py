@@ -6464,6 +6464,33 @@ def setup_http_server():
             amount = float(amount_rub)
             purchase["login"] = login_val
             description = f"Пополнение Steam для {login_val} на {amount_steam:.0f} ₽ (к оплате {amount:.2f} ₽)"
+        elif ptype == "march8":
+            try:
+                stars_amount = int(purchase.get("stars_amount") or 0)
+            except (TypeError, ValueError):
+                stars_amount = 0
+            login_val, login_err = _validate_login(purchase.get("login") or "", "Получатель")
+            if login_err:
+                return _json_response({"error": "bad_request", "message": login_err}, status=400)
+            stars_err = _validate_stars_amount(stars_amount)
+            if stars_err:
+                return _json_response({"error": "bad_request", "message": stars_err}, status=400)
+            gifts = purchase.get("gifts") or {}
+            gift_rub = 0.0
+            if isinstance(gifts, dict):
+                for gid, qty in gifts.items():
+                    try:
+                        q = int(qty or 0)
+                    except (TypeError, ValueError):
+                        q = 0
+                    price = MARCH8_GIFTS_PRICES.get(str(gid))
+                    if price and q > 0:
+                        gift_rub += float(price) * q
+            amount = round(stars_amount * _star + gift_rub, 2)
+            if amount < 1:
+                amount = 1.0
+            purchase["login"] = login_val
+            description = f"Подарок на 8 марта — {stars_amount}⭐ для @{login_val}"
         elif ptype == "spin":
             amount = 100.0
             description = "1 спин рулетки — 100 ₽"
