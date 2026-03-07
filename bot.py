@@ -6922,6 +6922,18 @@ def setup_http_server():
                 recipient = (purchase.get("login") or "").strip().lstrip("@")
                 stars_amount = int(purchase.get("stars_amount") or 0)
                 use_ton_wallet = bool(recipient and stars_amount >= 50 and TON_WALLET_ENABLED)
+                if not use_ton_wallet:
+                    why = []
+                    if not recipient:
+                        why.append("recipient пустой")
+                    if stars_amount < 50:
+                        why.append(f"stars_amount={stars_amount}<50")
+                    if not TON_WALLET_ENABLED:
+                        why.append("TON_WALLET_ENABLED=False")
+                    logger.info(
+                        "FreeKassa stars: use_ton_wallet=False, reason=%s (recipient=%r, stars=%s, TON_enabled=%s)",
+                        why or "?", recipient or "(empty)", stars_amount, TON_WALLET_ENABLED,
+                    )
 
                 tx_hash = None
                 send_err = None
