@@ -5760,11 +5760,24 @@ def setup_http_server():
                                             f"Получатель: @{recipient}",
                                             f"Stars отправлено: {stars_amount}⭐",
                                         ]
-                                        b = gifts.get("bouquet") or 0
-                                        h = gifts.get("heart") or 0
-                                        r = gifts.get("ring") or 0
-                                        if b or h or r:
-                                            lines.append(f"Подарки: 💐×{b} 💝×{h} 💍×{r}")
+                                        rose = int(gifts.get("rose") or 0)
+                                        diamond = int(gifts.get("diamond") or 0)
+                                        bouquet = int(gifts.get("bouquet") or 0)
+                                        heart = int(gifts.get("heart") or 0)
+                                        ring = int(gifts.get("ring") or 0)
+                                        gift_parts = []
+                                        if rose:
+                                            gift_parts.append(f"🌹×{rose}")
+                                        if diamond:
+                                            gift_parts.append(f"💎×{diamond}")
+                                        if bouquet:
+                                            gift_parts.append(f"💐×{bouquet}")
+                                        if heart:
+                                            gift_parts.append(f"💝×{heart}")
+                                        if ring:
+                                            gift_parts.append(f"💍×{ring}")
+                                        if gift_parts:
+                                            lines.append("Подарки: " + ", ".join(gift_parts))
                                         if msg_text:
                                             lines.append(f"Сообщение: {msg_text}")
                                         try:
