@@ -5269,7 +5269,9 @@ def setup_http_server():
                 login_val, login_err = _validate_login(purchase.get("login") or "", "Получатель")
                 if login_err:
                     return _json_response({"error": "bad_request", "message": login_err}, status=400)
-                stars_err = _validate_stars_amount(stars_amount)
+                stars_err = None
+                if stars_amount > 0:
+                    stars_err = _validate_stars_amount(stars_amount)
                 if stars_err:
                     return _json_response({"error": "bad_request", "message": stars_err}, status=400)
                 gifts = purchase.get("gifts") or {}
@@ -5286,7 +5288,10 @@ def setup_http_server():
                 amount = round(stars_amount * _star + gift_rub, 2)
                 if amount < 1:
                     amount = 1.0
-                description = f"Подарок на 8 марта — {stars_amount}⭐ для @{login_val}"
+                if stars_amount > 0:
+                    description = f"Подарок на 8 марта — {stars_amount}⭐ для @{login_val}"
+                else:
+                    description = f"Подарок на 8 марта для @{login_val}"
                 message = (purchase.get("message") or "").strip()[:500]
                 payload_data = json.dumps(
                     {
@@ -6473,7 +6478,9 @@ def setup_http_server():
             login_val, login_err = _validate_login(purchase.get("login") or "", "Получатель")
             if login_err:
                 return _json_response({"error": "bad_request", "message": login_err}, status=400)
-            stars_err = _validate_stars_amount(stars_amount)
+            stars_err = None
+            if stars_amount > 0:
+                stars_err = _validate_stars_amount(stars_amount)
             if stars_err:
                 return _json_response({"error": "bad_request", "message": stars_err}, status=400)
             gifts = purchase.get("gifts") or {}
@@ -6491,7 +6498,10 @@ def setup_http_server():
             if amount < 1:
                 amount = 1.0
             purchase["login"] = login_val
-            description = f"Подарок на 8 марта — {stars_amount}⭐ для @{login_val}"
+            if stars_amount > 0:
+                description = f"Подарок на 8 марта — {stars_amount}⭐ для @{login_val}"
+            else:
+                description = f"Подарок на 8 марта для @{login_val}"
         elif ptype == "spin":
             amount = 100.0
             description = "1 спин рулетки — 100 ₽"
