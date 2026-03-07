@@ -76,6 +76,22 @@ STAR_BUY_RATE_RUB_DEFAULT = float(os.getenv("STAR_BUY_RATE_RUB", "0.65") or "0.6
 STAR_PRICE_RUB_DEFAULT = float(os.getenv("STAR_PRICE_RUB", "1.37") or "1.37")
 STEAM_RATE_RUB_DEFAULT = float(os.getenv("STEAM_RATE_RUB", "1.06") or "1.06")
 
+# Подарочные наборы (фиксированные цены в рублях)
+GIFT_PACKS = {
+    "sweet": {"name": "Sweet Pack", "amount_rub": 399.0},
+    "spring": {"name": "Spring Pack", "amount_rub": 799.0},
+    "royal": {"name": "Royal Pack", "amount_rub": 1499.0},
+}
+
+# Подарок на 8 марта — цены подарков в рублях
+MARCH8_GIFTS_PRICES = {
+    "rose": 40.0,
+    "diamond": 140.0,
+    "bouquet": 70.0,
+    "heart": 30.0,
+    "ring": 140.0,
+}
+
 _star_price_rub_override: Optional[float] = None
 _star_buy_rate_rub_override: Optional[float] = None
 _steam_rate_rub_override: Optional[float] = None
@@ -5217,6 +5233,74 @@ def setup_http_server():
                     },
                     ensure_ascii=False,
                 )[:4096]
+            elif ptype == "gift_pack":
+                pack_id = (purchase.get("pack_id") or "").strip()
+                pack_cfg = GIFT_PACKS.get(pack_id)
+                if not pack_cfg:
+                    return _json_response(
+                        {"error": "bad_request", "message": "Неизвестный подарочный набор"},
+                        status=400,
+                    )
+                amount = float(pack_cfg.get("amount_rub") or 0.0)
+                if amount <= 0:
+                    return _json_response(
+                        {"error": "bad_request", "message": "Неверная цена подарочного набора"},
+                        status=400,
+                    )
+                description = f"Подарочный набор {pack_cfg.get('name')}"
+                payload_data = json.dumps(
+                    {
+                        "context": "purchase",
+                        "type": "gift_pack",
+                        "user_id": user_id,
+                        "pack_id": pack_id,
+                        "pack_name": pack_cfg.get("name"),
+                        "amount_rub": amount,
+                        "timestamp": time.time(),
+                    },
+                    ensure_ascii=False,
+                )[:4096]
+            elif ptype == "march8":
+                try:
+                    stars_amount = int(purchase.get("stars_amount") or 0)
+                except (TypeError, ValueError):
+                    stars_amount = 0
+                login_val, login_err = _validate_login(purchase.get("login") or "", "Получатель")
+                if login_err:
+                    return _json_response({"error": "bad_request", "message": login_err}, status=400)
+                stars_err = _validate_stars_amount(stars_amount)
+                if stars_err:
+                    return _json_response({"error": "bad_request", "message": stars_err}, status=400)
+                gifts = purchase.get("gifts") or {}
+                gift_rub = 0.0
+                if isinstance(gifts, dict):
+                    for gid, qty in gifts.items():
+                        try:
+                            q = int(qty or 0)
+                        except (TypeError, ValueError):
+                            q = 0
+                        price = MARCH8_GIFTS_PRICES.get(str(gid))
+                        if price and q > 0:
+                            gift_rub += float(price) * q
+                amount = round(stars_amount * _star + gift_rub, 2)
+                if amount < 1:
+                    amount = 1.0
+                description = f"Подарок на 8 марта — {stars_amount}⭐ для @{login_val}"
+                message = (purchase.get("message") or "").strip()[:500]
+                payload_data = json.dumps(
+                    {
+                        "context": "purchase",
+                        "type": "march8",
+                        "user_id": user_id,
+                        "login": login_val,
+                        "stars_amount": stars_amount,
+                        "amount_rub": amount,
+                        "gifts": gifts,
+                        "message": message,
+                        "timestamp": time.time(),
+                    },
+                    ensure_ascii=False,
+                )[:4096]
             elif ptype == "premium":
                 try:
                     months = int(purchase.get("months") or 0)
@@ -5633,6 +5717,71 @@ def setup_http_server():
                         except Exception as e:
                             logger.exception(f"CryptoBot webhook: error delivering stars for invoice_id={invoice_id}: {e}")
                 
+                elif purchase_type == "march8":
+                    # Подарок на 8 марта: выдаём Stars получателю + уведомляем админов о подарках
+                    recipient = (purchase.get("login") or "").strip().lstrip("@")
+                    stars_amount = int(purchase.get("stars_amount") or 0)
+                    gifts = purchase.get("gifts") or {}
+                    msg_text = (purchase.get("message") or "").strip()
+                    if recipient and stars_amount >= 50:
+                        try:
+                            if TON_WALLET_ENABLED:
+                                _, recipient_address = await _fragment_get_recipient_address(recipient)
+                                req_id = await _fragment_init_buy(recipient_address, stars_amount)
+                                tx_address, amount_nanoton, payload_b64 = await _fragment_get_buy_link(req_id)
+                                payload_decoded = _fragment_encoded(payload_b64)
+                                tx_hash, send_err = await _ton_wallet_send_safe(tx_address, amount_nanoton, payload_decoded)
+                                if tx_hash:
+                                    logger.info(
+                                        "CryptoBot webhook: march8 stars delivered, invoice_id=%s, recipient=%s, stars=%s",
+                                        invoice_id, recipient, stars_amount,
+                                    )
+                                    order_meta["delivered"] = True
+                                    if isinstance(orders, dict):
+                                        orders[str(invoice_id)]["delivered"] = True
+                                    _save_cryptobot_order_to_file(str(invoice_id), order_meta)
+                                    # Запись покупки + рефералы (как у stars)
+                                    try:
+                                        import db as _db
+                                        if _db.is_enabled():
+                                            await _db.user_upsert(user_id, purchase.get("username") or "", purchase.get("first_name") or "")
+                                            await _db.purchase_add(user_id, amount_rub, stars_amount, "stars", f"Подарок на 8 марта {stars_amount}⭐", None)
+                                        await _apply_referral_earnings_for_purchase(
+                                            user_id=user_id, amount_rub=amount_rub,
+                                            username=purchase.get("username") or "", first_name=purchase.get("first_name") or "",
+                                        )
+                                    except Exception as ref_err:
+                                        logger.warning("march8 referral/record: %s", ref_err)
+                                    # Уведомление админам о подарках
+                                    notify_chat_id = int(os.getenv("GIFTS_NOTIFY_CHAT_ID", "0") or "0") or SELL_STARS_NOTIFY_CHAT_ID
+                                    if notify_chat_id:
+                                        lines = [
+                                            "🎁 <b>Подарок на 8 марта</b>",
+                                            f"Получатель: @{recipient}",
+                                            f"Stars отправлено: {stars_amount}⭐",
+                                        ]
+                                        b = gifts.get("bouquet") or 0
+                                        h = gifts.get("heart") or 0
+                                        r = gifts.get("ring") or 0
+                                        if b or h or r:
+                                            lines.append(f"Подарки: 💐×{b} 💝×{h} 💍×{r}")
+                                        if msg_text:
+                                            lines.append(f"Сообщение: {msg_text}")
+                                        try:
+                                            await bot.send_message(
+                                                chat_id=notify_chat_id,
+                                                text="\n".join(lines),
+                                                parse_mode="HTML",
+                                            )
+                                        except Exception as e:
+                                            logger.warning("march8 notify admins: %s", e)
+                                else:
+                                    await notify_admins_payment_error(
+                                        f"march8: не удалось отправить {stars_amount}⭐ — {send_err}",
+                                        "CryptoBot march8",
+                                    )
+                        except Exception as e:
+                            logger.exception("CryptoBot webhook march8: %s", e)
                 elif purchase_type == "premium":
                     # Автоматическая выдача Telegram Premium через Fragment (как со звёздами)
                     recipient = (purchase.get("login") or "").strip().lstrip("@")
@@ -5715,7 +5864,40 @@ def setup_http_server():
                             user_id,
                             amount_rub,
                         )
-                
+                elif purchase_type == "gift_pack":
+                    # Подарочный набор: автоматической выдачи нет, только уведомление админам
+                    pack_id = (purchase.get("pack_id") or "").strip()
+                    pack_name = purchase.get("pack_name") or GIFT_PACKS.get(pack_id, {}).get("name") or "Подарочный набор"
+                    buyer_username = purchase.get("username") or ""
+                    lines = [
+                        "🎁 <b>Новый заказ подарочного набора</b>",
+                        "",
+                        f"Набор: <b>{pack_name}</b> (id: <code>{pack_id or '-'}</code>)",
+                    ]
+                    if buyer_username:
+                        lines.append(f"Покупатель: @{buyer_username} (ID: <code>{user_id}</code>)")
+                    else:
+                        lines.append(f"Покупатель ID: <code>{user_id}</code>")
+                    if amount_rub > 0:
+                        lines.append(f"Сумма оплаты: <b>{amount_rub:.2f} ₽</b>")
+                    lines.append("")
+                    lines.append("Отправьте соответствующий подарок этому пользователю.")
+                    notify_chat_id = int(os.getenv("GIFTS_NOTIFY_CHAT_ID", "0") or "0") or SELL_STARS_NOTIFY_CHAT_ID
+                    if notify_chat_id:
+                        try:
+                            await bot.send_message(
+                                chat_id=notify_chat_id,
+                                text="\n".join(lines),
+                                parse_mode="HTML",
+                                disable_web_page_preview=True,
+                            )
+                        except Exception as e:
+                            logger.warning("CryptoBot webhook: failed to notify gifts chat: %s", e)
+                    # Отмечаем заказ как доставленный, чтобы повторные вебхуки не дублировались
+                    order_meta["delivered"] = True
+                    if isinstance(orders, dict):
+                        orders[str(invoice_id)]["delivered"] = True
+                    _save_cryptobot_order_to_file(str(invoice_id), order_meta)
                 elif purchase_type == "spin":
                     order_meta["delivered"] = True
                     if isinstance(orders, dict):
