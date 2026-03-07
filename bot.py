@@ -4209,10 +4209,20 @@ def setup_http_server():
     try:
         import tonutils.client as _tu_client  # type: ignore  # noqa: F401
         _TONUTILS_AVAILABLE = True
-    except Exception:
+    except Exception as _e_ton:
         _TONUTILS_AVAILABLE = False
+        logger.warning("tonutils не загружается: %s (TON-кошелёк будет отключён)", _e_ton)
 
     TON_WALLET_ENABLED = bool(TONAPI_KEY and len(MNEMONIC) >= 24 and _TONUTILS_AVAILABLE)
+    if not TON_WALLET_ENABLED:
+        reasons = []
+        if not TONAPI_KEY:
+            reasons.append("TONAPI_KEY не задан")
+        if len(MNEMONIC) < 24:
+            reasons.append(f"MNEMONIC < 24 слов (сейчас {len(MNEMONIC)})")
+        if not _TONUTILS_AVAILABLE:
+            reasons.append("библиотека tonutils не установлена/не импортируется")
+        logger.warning("TON-кошелёк отключён: %s", "; ".join(reasons) if reasons else "неизвестная причина")
 
     # Клиент fragment-api-py (для Telegram Premium через Fragment)
     _FRAGMENT_API_CLIENT: Optional["AsyncFragmentAPI"] = None  # type: ignore[valid-type]
