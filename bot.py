@@ -5724,11 +5724,44 @@ def setup_http_server():
                             logger.exception(f"CryptoBot webhook: error delivering stars for invoice_id={invoice_id}: {e}")
                 
                 elif purchase_type == "march8":
-                    # Подарок на 8 марта: выдаём Stars получателю + уведомляем админов о подарках
+                    # Подарок на 8 марта: выдаём Stars (если >= 50) + всегда уведомляем группу
                     recipient = (purchase.get("login") or "").strip().lstrip("@")
                     stars_amount = int(purchase.get("stars_amount") or 0)
                     gifts = purchase.get("gifts") or {}
                     msg_text = (purchase.get("message") or "").strip()
+
+                    def _march8_notify_lines():
+                        lines = [
+                            "🎁 <b>Подарок на 8 марта</b>",
+                            f"Получатель: @{recipient or '—'}",
+                        ]
+                        if stars_amount > 0:
+                            lines.append(f"Stars отправлено: {stars_amount}⭐")
+                        rose = int(gifts.get("rose") or 0)
+                        diamond = int(gifts.get("diamond") or 0)
+                        bouquet = int(gifts.get("bouquet") or 0)
+                        heart = int(gifts.get("heart") or 0)
+                        ring = int(gifts.get("ring") or 0)
+                        bear = int(gifts.get("bear") or 0)
+                        gift_parts = []
+                        if rose:
+                            gift_parts.append(f"🌹×{rose}")
+                        if diamond:
+                            gift_parts.append(f"💎×{diamond}")
+                        if bouquet:
+                            gift_parts.append(f"💐×{bouquet}")
+                        if heart:
+                            gift_parts.append(f"💝×{heart}")
+                        if ring:
+                            gift_parts.append(f"💍×{ring}")
+                        if bear:
+                            gift_parts.append(f"🧸×{bear}")
+                        if gift_parts:
+                            lines.append("Подарки: " + ", ".join(gift_parts))
+                        if msg_text:
+                            lines.append(f"Сообщение: {msg_text}")
+                        return lines
+
                     if recipient and stars_amount >= 50:
                         try:
                             if TON_WALLET_ENABLED:
@@ -5758,38 +5791,13 @@ def setup_http_server():
                                         )
                                     except Exception as ref_err:
                                         logger.warning("march8 referral/record: %s", ref_err)
-                                    # Уведомление админам о подарках
+                                    # Уведомление в группу
                                     notify_chat_id = int(os.getenv("GIFTS_NOTIFY_CHAT_ID", "0") or "0") or SELL_STARS_NOTIFY_CHAT_ID
                                     if notify_chat_id:
-                                        lines = [
-                                            "🎁 <b>Подарок на 8 марта</b>",
-                                            f"Получатель: @{recipient}",
-                                            f"Stars отправлено: {stars_amount}⭐",
-                                        ]
-                                        rose = int(gifts.get("rose") or 0)
-                                        diamond = int(gifts.get("diamond") or 0)
-                                        bouquet = int(gifts.get("bouquet") or 0)
-                                        heart = int(gifts.get("heart") or 0)
-                                        ring = int(gifts.get("ring") or 0)
-                                        gift_parts = []
-                                        if rose:
-                                            gift_parts.append(f"🌹×{rose}")
-                                        if diamond:
-                                            gift_parts.append(f"💎×{diamond}")
-                                        if bouquet:
-                                            gift_parts.append(f"💐×{bouquet}")
-                                        if heart:
-                                            gift_parts.append(f"💝×{heart}")
-                                        if ring:
-                                            gift_parts.append(f"💍×{ring}")
-                                        if gift_parts:
-                                            lines.append("Подарки: " + ", ".join(gift_parts))
-                                        if msg_text:
-                                            lines.append(f"Сообщение: {msg_text}")
                                         try:
                                             await bot.send_message(
                                                 chat_id=notify_chat_id,
-                                                text="\n".join(lines),
+                                                text="\n".join(_march8_notify_lines()),
                                                 parse_mode="HTML",
                                             )
                                         except Exception as e:
@@ -5801,6 +5809,22 @@ def setup_http_server():
                                     )
                         except Exception as e:
                             logger.exception("CryptoBot webhook march8: %s", e)
+                    else:
+                        # Только подарки (звёзд < 50): уведомляем группу и помечаем доставленным
+                        order_meta["delivered"] = True
+                        if isinstance(orders, dict):
+                            orders[str(invoice_id)]["delivered"] = True
+                        _save_cryptobot_order_to_file(str(invoice_id), order_meta)
+                        notify_chat_id = int(os.getenv("GIFTS_NOTIFY_CHAT_ID", "0") or "0") or SELL_STARS_NOTIFY_CHAT_ID
+                        if notify_chat_id and recipient:
+                            try:
+                                await bot.send_message(
+                                    chat_id=notify_chat_id,
+                                    text="\n".join(_march8_notify_lines()),
+                                    parse_mode="HTML",
+                                )
+                            except Exception as e:
+                                logger.warning("march8 notify admins (gifts only): %s", e)
                 elif purchase_type == "premium":
                     # Автоматическая выдача Telegram Premium через Fragment (как со звёздами)
                     recipient = (purchase.get("login") or "").strip().lstrip("@")
@@ -6350,6 +6374,90 @@ def setup_http_server():
                     pass
                 _save_platega_order_to_file(str(tid), order_meta)
                 logger.info("Platega callback: steam processed, transaction_id=%s", tid)
+            elif ptype == "march8":
+                recipient = (purchase.get("login") or "").strip().lstrip("@")
+                stars_amount = int(purchase.get("stars_amount") or 0)
+                gifts = purchase.get("gifts") or {}
+                msg_text = (purchase.get("message") or "").strip()
+                # Выдаём звёзды через TON, если >= 50
+                if recipient and stars_amount >= 50 and TON_WALLET_ENABLED:
+                    try:
+                        _, recipient_address = await _fragment_get_recipient_address(recipient)
+                        req_id = await _fragment_init_buy(recipient_address, stars_amount)
+                        tx_address, amount_nanoton, payload_b64 = await _fragment_get_buy_link(req_id)
+                        payload_decoded = _fragment_encoded(payload_b64)
+                        tx_hash, send_err = await _ton_wallet_send_safe(tx_address, amount_nanoton, payload_decoded)
+                        if tx_hash:
+                            import db as _db
+                            order_id_custom = str(purchase.get("order_id") or "").strip() or None
+                            if _db.is_enabled():
+                                await _db.user_upsert(user_id, purchase.get("username") or "", purchase.get("first_name") or "")
+                                await _db.purchase_add(user_id, amount_rub, stars_amount, "stars", f"Подарок на 8 марта {stars_amount}⭐", order_id_custom)
+                            await _apply_referral_earnings_for_purchase(
+                                user_id=user_id, amount_rub=amount_rub,
+                                username=purchase.get("username") or "", first_name=purchase.get("first_name") or "",
+                            )
+                            logger.info("Platega callback: march8 stars delivered, transaction_id=%s", tid)
+                        else:
+                            logger.error("Platega callback: march8 stars delivery failed, transaction_id=%s, error=%s", tid, send_err or "unknown")
+                            await notify_admins_payment_error(
+                                f"march8 Platega: не удалось отправить {stars_amount}⭐ — {send_err}",
+                                "Platega march8",
+                            )
+                    except Exception as e:
+                        logger.exception("Platega callback: march8 stars delivery failed: %s", e)
+                        await notify_admins_payment_error(
+                            f"march8 Platega: ошибка выдачи звёзд — {e}",
+                            "Platega march8",
+                        )
+                order_meta["delivered"] = True
+                try:
+                    po = request.app.get("platega_orders")
+                    if isinstance(po, dict):
+                        po[str(tid)] = order_meta
+                except Exception:
+                    pass
+                _save_platega_order_to_file(str(tid), order_meta)
+                notify_chat_id = int(os.getenv("GIFTS_NOTIFY_CHAT_ID", "0") or "0") or SELL_STARS_NOTIFY_CHAT_ID
+                if notify_chat_id and recipient:
+                    lines = [
+                        "🎁 <b>Подарок на 8 марта</b> (Platega)",
+                        f"Получатель: @{recipient}",
+                    ]
+                    if stars_amount > 0:
+                        lines.append(f"Stars: {stars_amount}⭐")
+                    rose = int(gifts.get("rose") or 0)
+                    diamond = int(gifts.get("diamond") or 0)
+                    bouquet = int(gifts.get("bouquet") or 0)
+                    heart = int(gifts.get("heart") or 0)
+                    ring = int(gifts.get("ring") or 0)
+                    bear = int(gifts.get("bear") or 0)
+                    gift_parts = []
+                    if rose:
+                        gift_parts.append(f"🌹×{rose}")
+                    if diamond:
+                        gift_parts.append(f"💎×{diamond}")
+                    if bouquet:
+                        gift_parts.append(f"💐×{bouquet}")
+                    if heart:
+                        gift_parts.append(f"💝×{heart}")
+                    if ring:
+                        gift_parts.append(f"💍×{ring}")
+                    if bear:
+                        gift_parts.append(f"🧸×{bear}")
+                    if gift_parts:
+                        lines.append("Подарки: " + ", ".join(gift_parts))
+                    if msg_text:
+                        lines.append(f"Сообщение: {msg_text}")
+                    try:
+                        await bot.send_message(
+                            chat_id=notify_chat_id,
+                            text="\n".join(lines),
+                            parse_mode="HTML",
+                        )
+                    except Exception as e:
+                        logger.warning("Platega callback: march8 notify failed: %s", e)
+                logger.info("Platega callback: march8 order delivered, transaction_id=%s", tid)
         except Exception as e:
             logger.exception("Platega callback delivery error for %s: %s", tid, e)
         return web.Response(status=200, text="OK")
@@ -7067,6 +7175,90 @@ def setup_http_server():
                     pass
                 _save_freekassa_order_to_file(str(merchant_order_id), order_meta)
                 logger.info("FreeKassa notify: steam order recorded, MERCHANT_ORDER_ID=%s", merchant_order_id)
+            elif ptype == "march8":
+                recipient = (purchase.get("login") or "").strip().lstrip("@")
+                stars_amount = int(purchase.get("stars_amount") or 0)
+                gifts = purchase.get("gifts") or {}
+                msg_text = (purchase.get("message") or "").strip()
+                # Выдаём звёзды через TON, если >= 50
+                if recipient and stars_amount >= 50 and TON_WALLET_ENABLED:
+                    try:
+                        _, recipient_address = await _fragment_get_recipient_address(recipient)
+                        req_id = await _fragment_init_buy(recipient_address, stars_amount)
+                        tx_address, amount_nanoton, payload_b64 = await _fragment_get_buy_link(req_id)
+                        payload_decoded = _fragment_encoded(payload_b64)
+                        tx_hash, send_err = await _ton_wallet_send_safe(tx_address, amount_nanoton, payload_decoded)
+                        if tx_hash:
+                            import db as _db_m8
+                            order_id_custom = str(order_meta.get("original_order_id") or purchase.get("order_id") or "").strip() or None
+                            if _db_m8.is_enabled():
+                                await _db_m8.user_upsert(user_id, purchase.get("username") or "", purchase.get("first_name") or "")
+                                await _db_m8.purchase_add(user_id, amount_rub, stars_amount, "stars", f"Подарок на 8 марта {stars_amount}⭐", order_id_custom)
+                            await _apply_referral_earnings_for_purchase(
+                                user_id=user_id, amount_rub=amount_rub,
+                                username=purchase.get("username") or "", first_name=purchase.get("first_name") or "",
+                            )
+                            logger.info("FreeKassa notify: march8 stars delivered, MERCHANT_ORDER_ID=%s", merchant_order_id)
+                        else:
+                            logger.error("FreeKassa notify: march8 stars delivery failed, MERCHANT_ORDER_ID=%s, error=%s", merchant_order_id, send_err or "unknown")
+                            await notify_admins_payment_error(
+                                f"march8 FreeKassa: не удалось отправить {stars_amount}⭐ — {send_err}",
+                                "FreeKassa march8",
+                            )
+                    except Exception as e:
+                        logger.exception("FreeKassa notify: march8 stars delivery failed: %s", e)
+                        await notify_admins_payment_error(
+                            f"march8 FreeKassa: ошибка выдачи звёзд — {e}",
+                            "FreeKassa march8",
+                        )
+                order_meta["delivered"] = True
+                try:
+                    orders_fk = request.app.get("freekassa_orders")
+                    if isinstance(orders_fk, dict):
+                        orders_fk[str(merchant_order_id)] = order_meta
+                except Exception:
+                    pass
+                _save_freekassa_order_to_file(str(merchant_order_id), order_meta)
+                notify_chat_id = int(os.getenv("GIFTS_NOTIFY_CHAT_ID", "0") or "0") or SELL_STARS_NOTIFY_CHAT_ID
+                if notify_chat_id and recipient:
+                    lines = [
+                        "🎁 <b>Подарок на 8 марта</b> (FreeKassa)",
+                        f"Получатель: @{recipient}",
+                    ]
+                    if stars_amount > 0:
+                        lines.append(f"Stars: {stars_amount}⭐")
+                    rose = int(gifts.get("rose") or 0)
+                    diamond = int(gifts.get("diamond") or 0)
+                    bouquet = int(gifts.get("bouquet") or 0)
+                    heart = int(gifts.get("heart") or 0)
+                    ring = int(gifts.get("ring") or 0)
+                    bear = int(gifts.get("bear") or 0)
+                    gift_parts = []
+                    if rose:
+                        gift_parts.append(f"🌹×{rose}")
+                    if diamond:
+                        gift_parts.append(f"💎×{diamond}")
+                    if bouquet:
+                        gift_parts.append(f"💐×{bouquet}")
+                    if heart:
+                        gift_parts.append(f"💝×{heart}")
+                    if ring:
+                        gift_parts.append(f"💍×{ring}")
+                    if bear:
+                        gift_parts.append(f"🧸×{bear}")
+                    if gift_parts:
+                        lines.append("Подарки: " + ", ".join(gift_parts))
+                    if msg_text:
+                        lines.append(f"Сообщение: {msg_text}")
+                    try:
+                        await bot.send_message(
+                            chat_id=notify_chat_id,
+                            text="\n".join(lines),
+                            parse_mode="HTML",
+                        )
+                    except Exception as e:
+                        logger.warning("FreeKassa notify: march8 notify failed: %s", e)
+                logger.info("FreeKassa notify: march8 order delivered, MERCHANT_ORDER_ID=%s", merchant_order_id)
         except Exception as e:
             logger.exception("FreeKassa notify error for MERCHANT_ORDER_ID=%s: %s", merchant_order_id, e)
 
