@@ -90,6 +90,7 @@ MARCH8_GIFTS_PRICES = {
     "bouquet": 70.0,
     "heart": 30.0,
     "ring": 140.0,
+    "bear": 70.0,
 }
 
 _star_price_rub_override: Optional[float] = None
