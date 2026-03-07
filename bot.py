@@ -6919,8 +6919,17 @@ def setup_http_server():
 
         try:
             if ptype == "stars":
-                recipient = (purchase.get("login") or "").strip().lstrip("@")
-                stars_amount = int(purchase.get("stars_amount") or 0)
+                recipient = (purchase.get("login") or purchase.get("recipient") or "").strip().lstrip("@")
+                stars_amount = int(purchase.get("stars_amount") or purchase.get("starsAmount") or 0)
+                if stars_amount <= 0 and amount_rub > 0:
+                    try:
+                        import db as _db_fk
+                        rates = await _db_fk.rates_get() if _db_fk.is_enabled() else {}
+                        star_rate = float(rates.get("star_price_rub") or 0) or _get_star_price_rub()
+                        if star_rate > 0:
+                            stars_amount = int(round(amount_rub / star_rate))
+                    except Exception:
+                        pass
                 use_ton_wallet = bool(recipient and stars_amount >= 50 and TON_WALLET_ENABLED)
                 if not use_ton_wallet:
                     why = []
