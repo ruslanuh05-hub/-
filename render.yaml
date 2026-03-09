@@ -1,19 +1,56 @@
-# Render Blueprint - автодеплой JET Store Bot
+# JET Store Bot — деплой на Render
+# Dashboard: https://dashboard.render.com
+# После деплоя обновите JET_BOT_API_URL в JetStore/js/config.js на ваш URL (например https://jet-store-bot-xxx.onrender.com)
+
 services:
   - type: web
     name: jet-store-bot
     runtime: python
     plan: free
+
+    # Корень с ботом (если репозиторий содержит mini_app/)
+    rootDir: bot_JETstore
+
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
+
+    # Переменные окружения — значения задайте в Dashboard (Environment)
     envVars:
       - key: BOT_TOKEN
         sync: false
       - key: ADMIN_IDS
         sync: false
+      # Опционально: PostgreSQL (создайте БД в Render и вставьте connection string)
+      - key: DATABASE_URL
+        sync: false
+      # URL мини-приложения (по умолчанию jetstoreapp.ru)
       - key: WEB_APP_URL
+        value: https://jetstoreapp.ru
+      # Опционально: для Fragment API, CryptoBot, Telethon и т.д.
+      - key: TELEGRAM_API_ID
         sync: false
-      - key: CRYPTOBOT_USDT_AMOUNT
+      - key: TELEGRAM_API_HASH
         sync: false
-      - key: CRYPTO_PAY_TOKEN
+      - key: TELEGRAM_STRING_SESSION
         sync: false
+      # Render автоматически задаёт:
+      # PORT, RENDER_EXTERNAL_URL (для webhook)
+
+  # Keep-alive: пингует web-сервис каждые 5 минут,
+  # чтобы он не "засыпал" на free (через приватную сеть).
+  - type: cron
+    name: jet-store-keepalive
+    runtime: python
+    plan: starter
+    rootDir: bot_JETstore
+    schedule: "*/5 * * * *"
+    buildCommand: "true"
+    startCommand: "python keepalive.py"
+    envVars:
+      - key: TARGET_HOSTPORT
+        fromService:
+          name: jet-store-bot
+          type: web
+          property: hostport
+      - key: TARGET_PATH
+        value: /api/health
