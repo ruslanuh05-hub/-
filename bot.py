@@ -1667,9 +1667,11 @@ async def admin_notification(callback_query: types.CallbackQuery):
         ]
     )
     
+    broadcast_count = await _get_broadcast_users_count()
     await callback_query.message.answer(
         f"📢 <b>Управление уведомлениями</b>\n\n"
-        f"👥 Всего пользователей: {db.get_users_count()}",
+        f"👥 Получателей рассылки: <b>{broadcast_count}</b>\n"
+        f"<i>(все, кто когда-либо нажимал /start, даже если чат удалён)</i>",
         reply_markup=notification_keyboard,
         parse_mode="HTML"
     )
@@ -1805,6 +1807,31 @@ def _apply_button_color_emoji(text: str, color: str | None) -> str:
     return base
 
 
+async def _get_broadcast_users_count() -> int:
+    """Количество пользователей для рассылки (PostgreSQL + in-memory + users_data.json)."""
+    user_ids_set = set()
+    for uid in db.get_all_users():
+        user_ids_set.add(str(uid))
+    try:
+        import db as _db_bc
+        if _db_bc.is_enabled():
+            for uid in await _db_bc.get_all_user_ids_for_broadcast():
+                user_ids_set.add(str(uid))
+    except Exception:
+        pass
+    try:
+        _bp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "users_data.json")
+        if os.path.exists(_bp):
+            _ud = _read_json_file(_bp) or {}
+            if isinstance(_ud, dict):
+                for uid in _ud.keys():
+                    if uid and str(uid).strip().isdigit():
+                        user_ids_set.add(str(uid))
+    except Exception:
+        pass
+    return len(user_ids_set)
+
+
 def _build_notification_keyboard(buttons: list[dict] | None) -> InlineKeyboardMarkup | None:
     """Собирает InlineKeyboardMarkup для рассылки из структуры в состоянии."""
     if not buttons:
@@ -1879,10 +1906,11 @@ async def _send_notification_preview(message: types.Message, state: FSMContext):
     if len(preview_text) > 200:
         preview_text = preview_text[:200] + "..."
 
+    broadcast_count = await _get_broadcast_users_count()
     await message.answer(
         f"📢 <b>Подтверждение отправки:</b>\n\n"
         f"{preview_text}\n\n"
-        f"👥 Будет отправлено: <b>{db.get_users_count()}</b> пользователям",
+        f"👥 Будет отправлено: <b>{broadcast_count}</b> пользователям (все, кто когда-либо нажимал /start)",
         parse_mode="HTML",
         reply_markup=reply_markup,
     )
@@ -1940,7 +1968,27 @@ async def confirm_notification(callback_query: types.CallbackQuery, state: FSMCo
     
     await callback_query.message.edit_text("🔄 <b>Начинаю рассылку...</b>", parse_mode="HTML")
     
-    users = db.get_all_users()
+    # Собираем всех: PostgreSQL (users + purchases) + in-memory + users_data.json
+    user_ids_set = set()
+    for uid in db.get_all_users():
+        user_ids_set.add(str(uid))
+    try:
+        import db as _db_bc
+        if _db_bc.is_enabled():
+            for uid in await _db_bc.get_all_user_ids_for_broadcast():
+                user_ids_set.add(str(uid))
+    except Exception as e:
+        logger.warning("confirm_notification: failed to load users from PostgreSQL: %s", e)
+    try:
+        _bd_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "users_data.json")
+        if os.path.exists(_bd_path):
+            _ud = _read_json_file(_bd_path) or {}
+            if isinstance(_ud, dict):
+                for uid in _ud.keys():
+                    user_ids_set.add(str(uid))
+    except Exception as e:
+        logger.warning("confirm_notification: failed to load users_data.json: %s", e)
+    users = [uid for uid in user_ids_set if uid and str(uid).strip().isdigit()]
     total = len(users)
     successful = 0
     failed = 0
@@ -1948,11 +1996,12 @@ async def confirm_notification(callback_query: types.CallbackQuery, state: FSMCo
     # Готовим клавиатуру для рассылки (если задана)
     broadcast_markup = _build_notification_keyboard(buttons)
 
-    # Отправляем уведомления
+    # Отправляем уведомления (в т.ч. тем, кто удалил чат — попытка будет, ошибка залогируется)
     for i, user_id in enumerate(users, 1):
+        chat_id = int(user_id) if str(user_id).isdigit() else user_id
         try:
             await bot.send_message(
-                chat_id=user_id,
+                chat_id=chat_id,
                 text=notification_text,
                 parse_mode="HTML",
                 reply_markup=broadcast_markup
