@@ -334,6 +334,25 @@ async def get_users_with_purchases(stars_only: bool = True) -> dict:
     return users
 
 
+async def get_all_user_ids_for_broadcast() -> list:
+    """
+    Все user_id для рассылки: users + purchases.
+    Возвращает всех, кто когда-либо нажал /start или делал покупку (даже если чат удалён — попытка отправки будет).
+    """
+    if not _db_enabled:
+        return []
+    user_ids = []
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch("SELECT id FROM users")
+        user_ids = [str(r["id"]) for r in rows]
+        pur_rows = await conn.fetch("SELECT DISTINCT user_id FROM purchases")
+        for r in pur_rows:
+            uid = str(r["user_id"])
+            if uid not in user_ids:
+                user_ids.append(uid)
+    return user_ids
+
+
 # --- Rating prefs ---
 
 async def rating_get_all() -> dict:

@@ -1047,6 +1047,7 @@ class AdminStates(StatesGroup):
     waiting_notification_photo = State()
     waiting_user_balance = State()
     waiting_order_id = State()
+    waiting_menu_photo_text = State()
 
 
 class SellStarsStates(StatesGroup):
@@ -1082,7 +1083,7 @@ def get_main_menu(language: str = 'ru'):
             InlineKeyboardButton(text="🚀 Открыть приложение", web_app=WebAppInfo(url=WEB_APP_URL)),
         ],
         [
-            InlineKeyboardButton(text="📰 Подписаться на канал", url="https://t.me/JetStoreApp"),
+            InlineKeyboardButton(text="📰 Подписаться на канал", url="https://t.me/ezstar_tg"),
         ],
         [
             InlineKeyboardButton(text="? Помощь", callback_data="help_info"),
@@ -1094,8 +1095,8 @@ def get_about_menu(language: str = 'ru'):
     """Меню 'О нас' (только русский текст)"""
     keyboard = [
         [
-            InlineKeyboardButton(text="📞 Помощь", url="https://t.me/L3ZTADM"),
-            InlineKeyboardButton(text="📢 Наш канал", url="https://t.me/JetStoreApp")
+            InlineKeyboardButton(text="📞 Помощь", url="https://t.me/JetStoreHelper"),
+            InlineKeyboardButton(text="📢 Наш канал", url="https://t.me/ezstar_tg")
         ],
         [
             InlineKeyboardButton(text="📄 Договор оферты",
@@ -1123,9 +1124,10 @@ def get_admin_menu():
         ],
         [
             InlineKeyboardButton(text="📢 Рассылка", callback_data="admin_notification"),
-            InlineKeyboardButton(text="🖼️ Изменить фото", callback_data="admin_photo")
+            InlineKeyboardButton(text="🧾 Меню", callback_data="admin_menu")
         ],
         [
+            InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats"),
             InlineKeyboardButton(text="🔍 Поиск заказа", callback_data="admin_search_order"),
         ],
         [
@@ -1392,21 +1394,14 @@ async def cmd_admin(message: types.Message):
     if not is_admin(user_id):
         return
     
-    stats_text = (
-        f"⚙️ <b>Панель администратора</b>\n\n"
-        f"📊 Статистика:\n"
-        f"• Всего пользователей: {db.get_users_count()}\n"
-        f"• Активных за 7 дней: {len(db.get_active_users(7))}\n"
-        f"• Администраторов: {len(ADMIN_IDS)}\n\n"
+    text = (
+        "⚙️ <b>Панель администратора</b>\n\n"
         f"🆔 Ваш ID: <code>{user_id}</code>\n"
-        f"👑 Ваш статус: Администратор ✅"
+        "👑 Ваш статус: Администратор ✅\n\n"
+        "Выберите действие:"
     )
     
-    await message.answer(
-        stats_text,
-        reply_markup=get_admin_menu(),
-        parse_mode="HTML"
-    )
+    await message.answer(text, reply_markup=get_admin_menu(), parse_mode="HTML")
 
 # ============ АДМИН ПАНЕЛЬ ============
 
@@ -1537,19 +1532,23 @@ async def save_welcome_text(message: types.Message, state: FSMContext):
     await message.answer(f"✅ Текст приветствия на {language} обновлен!")
     await state.clear()
 
-# ============ УПРАВЛЕНИЕ ФОТО ============
+# ============ УПРАВЛЕНИЕ МЕНЮ (ФОТО + ТЕКСТ) ============
 
-@dp.callback_query(F.data == "admin_photo")
-async def admin_photo(callback_query: types.CallbackQuery):
-    """Управление фото"""
+@dp.callback_query(F.data == "admin_menu")
+async def admin_menu(callback_query: types.CallbackQuery):
+    """Меню: управление текстом и фото приветствия"""
     if not is_admin(callback_query.from_user.id):
         await callback_query.answer("⛔ Нет прав администратора", show_alert=True)
         return
     
-    photo_keyboard = InlineKeyboardMarkup(
+    menu_keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="🖼️ Загрузить фото", callback_data="upload_photo")
+                InlineKeyboardButton(text="📸 Фото + текст", callback_data="menu_photo_text")
+            ],
+            [
+                InlineKeyboardButton(text="🖼️ Только фото", callback_data="upload_photo"),
+                InlineKeyboardButton(text="📝 Только текст", callback_data="admin_welcome")
             ],
             [
                 InlineKeyboardButton(text="🗑️ Удалить фото", callback_data="remove_photo")
@@ -1561,13 +1560,14 @@ async def admin_photo(callback_query: types.CallbackQuery):
     )
     
     current_photo = db.get_content('welcome_photo')
-    status = "✅ Установлено" if current_photo else "❌ Не установлено"
+    status = "✅ Фото установлено" if current_photo else "❌ Фото не установлено"
     
     await callback_query.message.answer(
-        f"🖼️ <b>Управление фото</b>\n\n"
-        f"Статус: {status}",
-        reply_markup=photo_keyboard,
-        parse_mode="HTML"
+        "🧾 <b>Меню в боте</b>\n\n"
+        "Здесь можно настроить обложку и текст главного меню.\n\n"
+        f"Статус фото: {status}",
+        reply_markup=menu_keyboard,
+        parse_mode="HTML",
     )
     await callback_query.answer()
 
@@ -1586,6 +1586,22 @@ async def upload_photo(callback_query: types.CallbackQuery, state: FSMContext):
         parse_mode="HTML"
     )
     await state.set_state(AdminStates.waiting_welcome_photo)
+    await callback_query.answer()
+
+
+@dp.callback_query(F.data == "menu_photo_text")
+async def menu_photo_text(callback_query: types.CallbackQuery, state: FSMContext):
+    """Задать фото и текст меню одним сообщением (фото с подписью)."""
+    if not is_admin(callback_query.from_user.id):
+        await callback_query.answer("⛔ Нет прав администратора", show_alert=True)
+        return
+    
+    await callback_query.message.answer(
+        "🧾 <b>Отправьте фото для главного меню</b> с подписью.\n\n"
+        "📸 Фото станет обложкой, а подпись — текстом приветствия.",
+        parse_mode="HTML",
+    )
+    await state.set_state(AdminStates.waiting_menu_photo_text)
     await callback_query.answer()
 
 @dp.message(AdminStates.waiting_welcome_photo)
@@ -1624,6 +1640,45 @@ async def save_welcome_photo(message: types.Message, state: FSMContext):
         parse_mode="HTML"
     )
     
+    await state.clear()
+
+
+@dp.message(AdminStates.waiting_menu_photo_text)
+async def save_menu_photo_text(message: types.Message, state: FSMContext):
+    """Сохранить фото и текст меню из одного сообщения (фото + подпись)."""
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Нет прав администратора")
+        await state.clear()
+        return
+    
+    if not message.photo:
+        await message.answer("❌ Пожалуйста, отправьте фото с подписью (оно станет текстом меню).")
+        return
+    
+    photo = message.photo[-1]
+    file_id = photo.file_id
+    caption = message.html_text or message.caption or ""
+    if not caption:
+        caption = db.get_content('welcome_text_ru', '👋 <b>Добро пожаловать в Jet Store!</b>\n\nВыберите действие:')
+    
+    # Сохраняем и фото, и текст меню (по‑умолчанию RU)
+    db.update_content('welcome_photo', file_id)
+    db.update_content('welcome_text_ru', caption)
+    
+    db.add_notification({
+        'type': 'menu_update',
+        'admin_id': message.from_user.id,
+        'admin_name': message.from_user.first_name,
+        'text': 'Обновлены фото и текст меню',
+        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    })
+    
+    await message.answer("✅ Фото и текст меню обновлены!")
+    await message.answer_photo(
+        photo=file_id,
+        caption=caption,
+        parse_mode="HTML",
+    )
     await state.clear()
 
 @dp.callback_query(F.data == "remove_photo")
@@ -2114,16 +2169,28 @@ async def show_about(callback_query: types.CallbackQuery):
 async def show_help(callback_query: types.CallbackQuery):
     """Раздел 'Помощь и контакты'"""
     help_text = (
-        "💡 <b>Помощь и контакты</b>\n\n"
-        "Поддержка: <a href=\"https://t.me/JetStoreHelper\">@JetStoreHelper</a>\n\n"
-        "📄 Договор оферты: "
-        "<a href=\"https://telegra.ph/Dogovor-Oferty-02-11-4\">читать</a>\n"
-        "🔒 Политика конфиденциальности: "
-        "<a href=\"https://telegra.ph/Politika-konfidecialnosti-02-11\">читать</a>\n"
-        "📜 Пользовательское соглашение: "
-        "<a href=\"https://telegra.ph/Polzovatelskoe-soglashenie-02-11-33\">читать</a>"
+        "ℹ️ <b>О нас</b>\n\n"
+        "JET STORE — надёжный сервис для покупки Telegram Stars, Premium "
+        "и пополнения Steam.\n\n"
+        "Ниже — кнопки с документами и поддержкой."
     )
-    await callback_query.message.answer(help_text, parse_mode="HTML", disable_web_page_preview=True)
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="📄 Документы", callback_data="about_info"),
+            ],
+            [
+                InlineKeyboardButton(text="📢 Наш канал", url="https://t.me/ezstar_tg"),
+            ],
+            [
+                InlineKeyboardButton(text="📞 Поддержка", url="https://t.me/JetStoreHelper"),
+            ],
+            [
+                InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main"),
+            ],
+        ]
+    )
+    await callback_query.message.answer(help_text, parse_mode="HTML", reply_markup=keyboard, disable_web_page_preview=True)
     await callback_query.answer()
 
 # ============ ПРОФИЛЬ ============
