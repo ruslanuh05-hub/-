@@ -832,8 +832,8 @@ class Database:
 
 Мы предоставляем:
 • ⭐️ <b>Покупку звёзд</b>
-• 🎡 <b>Участие в рулетке</b>
-• 🗂️ <b>Каталог цифровых товаров</b>''',
+• 💍 <b>Покупка Premium</b>
+• 👾 <b>Пополнение Steam</b>''',
             'about_text_en': '''<b><tg-emoji emoji-id="5422439311196834318">💡</tg-emoji> About Jet Store Service</b>
 
 We provide:
