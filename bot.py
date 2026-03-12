@@ -1183,20 +1183,10 @@ async def cmd_start(message: types.Message, state: FSMContext):
     except Exception as e:
         logger.warning(f"Ошибка обработки реферального старта /start: {e}")
 
-    username_display = user.username and f"@{user.username}" or user.first_name or "друг"
     language = db.get_user_language(user.id)
-
-    text = (
-        "Добро пожаловать в <b>Jet Store</b>! 🚀\n"
-        f"Привет, <b>{username_display}</b>!\n\n"
-        "⚡ Покупай и управляй цифровыми товарами прямо в Telegram.\n\n"
-        "Выбери действие:"
-    )
-
-    # Используем стандартное меню с кнопкой отзывов
-    keyboard = get_main_menu(language)
-
-    await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
+    
+    # Показываем единое главное меню (с текстом и фото, если оно задано в админке)
+    await show_main_menu(message, language)
 
 
 # ============ ПРОДАЖА ЗВЁЗД ЗА STARS ============
@@ -2206,24 +2196,7 @@ async def back_to_main(callback_query: types.CallbackQuery):
     user_id = callback_query.from_user.id
     language = db.get_user_language(user_id)
     
-    # Получаем текст приветствия
-    if language == 'en':
-        welcome_text = db.get_content('welcome_text_en', '👋 <b>Welcome to Jet Store!</b>\n\nChoose action:')
-    else:
-        welcome_text = db.get_content('welcome_text_ru', '👋 <b>Добро пожаловать в Jet Store!</b>\n\nВыберите действие:')
-    
-    keyboard = get_main_menu(language)
-    
-    # Редактируем сообщение вместо отправки нового
-    try:
-        await callback_query.message.edit_text(
-            text=welcome_text,
-            reply_markup=keyboard,
-            parse_mode="HTML"
-        )
-    except Exception as e:
-        # Если редактирование не удалось (например, сообщение с фото), отправляем новое
-        logger.warning(f"Не удалось отредактировать сообщение: {e}")
+    # Всегда показываем единое главное меню (с учётом фото/текста из админки)
     await show_main_menu(callback_query.message, language)
     
     await callback_query.answer()
