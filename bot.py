@@ -3767,11 +3767,24 @@ def setup_http_server():
         earned_rub = float(ref.get("earned_rub") or 0.0)
         total_earned_rub = float(ref.get("total_earned_rub") or earned_rub or 0.0)
         volume_rub = float(ref.get("volume_rub") or 0.0)
+
+        # Конвертация объёма покупок в звёзды по тому же курсу,
+        # который админ задаёт в панели (star_buy_rate_rub или star_price_rub).
+        try:
+            star_rate_rub = _get_star_buy_rate_rub() or _get_star_price_rub()
+        except Exception:
+            star_rate_rub = 0.0
+        if not star_rate_rub or star_rate_rub <= 0:
+            # Фоллбек: 1 звезда ≈ 0.65 ₽, как в мини‑аппе
+            star_rate_rub = 0.65
+        volume_stars = volume_rub / float(star_rate_rub or 1.0)
         payload = {
             "user_id": uid,
             "earned_rub": round(earned_rub, 2),
             "total_earned_rub": round(total_earned_rub, 2),
             "volume_rub": round(volume_rub, 2),
+            # Объём в звёздах, рассчитанный на сервере по курсу из админки
+            "volume_stars": int(volume_stars) if volume_stars > 0 else 0,
             "referrals_level1": lvl1,
             "referrals_level2": lvl2,
             "referrals_level3": lvl3,
