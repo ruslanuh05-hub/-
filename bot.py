@@ -4,6 +4,7 @@ import json
 import os
 import re
 import base64
+import secrets
 import time
 import uuid
 import hmac
@@ -2781,32 +2782,59 @@ def setup_http_server():
 
     app.router.add_get('/api/config', api_config_handler)
 
-    # Admin: проверка пароля на бэкенде (пароль в ADMIN_PASSWORD env)
-    ADMIN_PASSWORD = (os.environ.get("ADMIN_PASSWORD") or "").strip()
+    # Admin: пароль из env (Render: Environment → ADMIN_PASSWORD). Сессия на 1 час.
+    ADMIN_PASSWORD = (
+        (os.environ.get("ADMIN_PASSWORD") or os.environ.get("RENDER_ADMIN_PASSWORD") or "").strip()
+    ).replace("\r", "").replace("\n", "").strip()
+    if not ADMIN_PASSWORD:
+        logger.warning("ADMIN_PASSWORD не задан в env (Render: Dashboard → Environment → ADMIN_PASSWORD). Админка вернёт 503.")
+    else:
+        logger.info("ADMIN_PASSWORD задан в env (длина %d), админка защищена", len(ADMIN_PASSWORD))
+    ADMIN_SESSION_TTL = 3600  # 1 час
+    _admin_sessions = {}  # token -> expires_at (float)
+
+    def _admin_auth_from_request(request):
+        auth = request.headers.get("Authorization") or ""
+        return (auth.replace("Bearer ", "").replace("bearer ", "").strip() if auth else "") or request.headers.get("X-Admin-Password") or ""
+
+    def _admin_authorized(request):
+        value = _admin_auth_from_request(request)
+        if not value or not ADMIN_PASSWORD:
+            return False
+        if value == ADMIN_PASSWORD:
+            return True
+        now = time.time()
+        if value in _admin_sessions:
+            if now < _admin_sessions[value]:
+                return True
+            del _admin_sessions[value]
+        return False
 
     async def admin_verify_handler(request):
-        """POST /api/admin/verify — проверка пароля админки. JSON: { "password": "..." }"""
+        """POST /api/admin/verify — проверка пароля админки. JSON: { "password": "..." }. Возвращает токен сессии на 1 час."""
         try:
             body = await request.json()
         except Exception:
             return _json_response({"ok": False, "message": "Invalid JSON"}, status=400)
-        pwd = (body.get("password") or "").strip()
+        pwd = (body.get("password") or "").strip().replace("\r", "").replace("\n", "").strip()
         if not ADMIN_PASSWORD:
             logger.warning("ADMIN_PASSWORD не задан в env — админка не защищена")
             return _json_response({"ok": False, "message": "Админка не настроена"}, status=503)
-        ok = pwd and len(pwd) > 0 and pwd == ADMIN_PASSWORD
-        return _json_response({"ok": ok})
+        if not pwd or pwd != ADMIN_PASSWORD:
+            return _json_response({"ok": False, "message": "Неверный пароль"})
+        token = secrets.token_urlsafe(32)
+        expires_at = time.time() + ADMIN_SESSION_TTL
+        _admin_sessions[token] = expires_at
+        return _json_response({"ok": True, "token": token, "expires_at": int(expires_at)})
 
     app.router.add_post("/api/admin/verify", admin_verify_handler)
     app.router.add_route("OPTIONS", "/api/admin/verify", lambda r: Response(status=204, headers=_cors_headers()))
 
     async def admin_stats_handler(request):
-        """GET /api/admin/stats — статистика для админки. Заголовок: Authorization: Bearer <ADMIN_PASSWORD>"""
+        """GET /api/admin/stats — статистика для админки. Заголовок: Authorization: Bearer <пароль или токен сессии>"""
+        if not _admin_authorized(request):
+            return _json_response({"error": "unauthorized"}, status=401)
         try:
-            auth = request.headers.get("Authorization") or ""
-            token = (auth.replace("Bearer ", "").replace("bearer ", "").strip() if auth else "") or request.headers.get("X-Admin-Password") or ""
-            if not ADMIN_PASSWORD or token != ADMIN_PASSWORD:
-                return _json_response({"error": "unauthorized"}, status=401)
             # 1) БАЗОВЫЕ ДАННЫЕ: JSON (users_data.json) — чтобы не потерять старую статистику
             path = _get_users_data_path()
             users_data = _read_json_file(path) if path else {}
@@ -3003,12 +3031,10 @@ def setup_http_server():
     async def admin_balance_adjust_handler(request):
         """
         POST /api/admin/balance-adjust
-        Заголовок: Authorization: Bearer <ADMIN_PASSWORD>
+        Заголовок: Authorization: Bearer <пароль или токен сессии>
         JSON: { "username": "name", "user_id": "123", "amount": 100 }  # amount может быть отрицательной
         """
-        auth = request.headers.get("Authorization") or ""
-        token = (auth.replace("Bearer ", "").replace("bearer ", "").strip() if auth else "") or request.headers.get("X-Admin-Password") or ""
-        if not ADMIN_PASSWORD or token != ADMIN_PASSWORD:
+        if not _admin_authorized(request):
             return _json_response({"success": False, "error": "unauthorized"}, status=401)
 
         try:
