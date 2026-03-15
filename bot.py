@@ -3089,6 +3089,59 @@ def setup_http_server():
     app.router.add_post("/api/admin/balance-adjust", admin_balance_adjust_handler)
     app.router.add_route("OPTIONS", "/api/admin/balance-adjust", lambda r: Response(status=204, headers=_cors_headers()))
 
+    async def admin_referral_balance_adjust_handler(request):
+        """
+        POST /api/admin/referral-balance-adjust
+        Заголовок: Authorization: Bearer <пароль или токен сессии>
+        JSON: { "username": "name" или "user_id": "123", "amount": 100 } — начислить реферальный баланс (earned_rub).
+        """
+        if not _admin_authorized(request):
+            return _json_response({"success": False, "error": "unauthorized"}, status=401)
+        try:
+            body = await request.json() if request.can_read_body else {}
+        except Exception:
+            body = {}
+        username = (body.get("username") or "").strip().lstrip("@")
+        user_id = str(body.get("user_id") or "").strip()
+        try:
+            amount = float(body.get("amount") or 0)
+        except (TypeError, ValueError):
+            amount = 0.0
+        if not amount or amount <= 0:
+            return _json_response({"success": False, "error": "bad_amount", "message": "Укажите положительную сумму"}, status=400)
+        import db as _db_ref
+        if not user_id:
+            if not username:
+                return _json_response({"success": False, "error": "bad_request", "message": "Нужен username или user_id"}, status=400)
+            user_id = await _db_ref.user_find_by_username(username)
+            if not user_id:
+                return _json_response({"success": False, "error": "not_found", "message": "Пользователь не найден"}, status=404)
+        if _db_ref.is_enabled():
+            await _db_ref.ref_get_or_create(user_id)
+            await _db_ref.ref_add_earned(user_id, 0.0, amount)
+            ref = await _db_ref.ref_get_or_create(user_id)
+            REFERRALS[user_id] = ref
+        else:
+            await _load_referrals()
+            if user_id not in REFERRALS:
+                REFERRALS[user_id] = {
+                    "parent1": None, "parent2": None, "parent3": None,
+                    "referrals_l1": [], "referrals_l2": [], "referrals_l3": [],
+                    "earned_rub": 0.0, "volume_rub": 0.0,
+                }
+            REFERRALS[user_id]["earned_rub"] = REFERRALS[user_id].get("earned_rub", 0) + amount
+            _save_referrals_sync()
+            ref = REFERRALS[user_id]
+        return _json_response({
+            "success": True,
+            "user_id": user_id,
+            "amount": amount,
+            "earned_rub": float(ref.get("earned_rub") or 0),
+        })
+
+    app.router.add_post("/api/admin/referral-balance-adjust", admin_referral_balance_adjust_handler)
+    app.router.add_route("OPTIONS", "/api/admin/referral-balance-adjust", lambda r: Response(status=204, headers=_cors_headers()))
+
     # Отдаём robots.txt, чтобы боты (например, Яндекс) не вызывали 404 и не засоряли логи
     async def robots_handler(request):
         """
