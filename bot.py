@@ -3142,6 +3142,80 @@ def setup_http_server():
     app.router.add_post("/api/admin/referral-balance-adjust", admin_referral_balance_adjust_handler)
     app.router.add_route("OPTIONS", "/api/admin/referral-balance-adjust", lambda r: Response(status=204, headers=_cors_headers()))
 
+    async def admin_rating_add_handler(request):
+        """
+        POST /api/admin/rating-add
+        Заголовок: Authorization: Bearer <пароль или токен сессии>
+        JSON: { "username": "name" или "user_id": "123", "stars_amount": 1000, "amount_rub": 1370? }
+        Добавляет запись покупки звёзд в рейтинг (DB purchases / users_data.json).
+        """
+        if not _admin_authorized(request):
+            return _json_response({"success": False, "error": "unauthorized"}, status=401)
+        try:
+            body = await request.json() if request.can_read_body else {}
+        except Exception:
+            body = {}
+        username = (body.get("username") or "").strip().lstrip("@")
+        user_id = str(body.get("user_id") or "").strip()
+        try:
+            stars_amount = int(body.get("stars_amount") or body.get("stars") or 0)
+        except (TypeError, ValueError):
+            stars_amount = 0
+        try:
+            amount_rub = float(body.get("amount_rub") or body.get("amount") or 0)
+        except (TypeError, ValueError):
+            amount_rub = 0.0
+        if stars_amount <= 0:
+            return _json_response({"success": False, "error": "bad_request", "message": "stars_amount обязателен"}, status=400)
+
+        import db as _db_admin
+        if not user_id:
+            if not username:
+                return _json_response({"success": False, "error": "bad_request", "message": "Нужен username или user_id"}, status=400)
+            user_id = await _db_admin.user_find_by_username(username)
+            if not user_id:
+                return _json_response({"success": False, "error": "not_found", "message": "Пользователь не найден"}, status=404)
+
+        if amount_rub <= 0:
+            amount_rub = round(float(stars_amount) * float(_get_star_price_rub() or 1.37), 2)
+
+        product_name = f"{stars_amount} звёзд (admin)"
+        purchase_type_str = "stars"
+
+        if _db_admin.is_enabled():
+            await _db_admin.user_upsert(user_id, username, "")
+            await _db_admin.purchase_add(user_id, amount_rub, stars_amount, purchase_type_str, product_name, None)
+        else:
+            path = _get_users_data_path()
+            users_data = _read_json_file(path) or {}
+            if user_id not in users_data:
+                users_data[user_id] = {
+                    "id": int(user_id) if user_id.isdigit() else user_id,
+                    "username": username,
+                    "first_name": "",
+                    "purchases": [],
+                }
+            u = users_data[user_id]
+            if "purchases" not in u:
+                u["purchases"] = []
+            u["purchases"].append({
+                "stars_amount": stars_amount,
+                "amount": amount_rub,
+                "type": purchase_type_str,
+                "productName": product_name,
+                "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            })
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(users_data, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                logger.warning("admin_rating_add write users_data: %s", e)
+
+        return _json_response({"success": True, "user_id": user_id, "stars_amount": stars_amount, "amount_rub": amount_rub})
+
+    app.router.add_post("/api/admin/rating-add", admin_rating_add_handler)
+    app.router.add_route("OPTIONS", "/api/admin/rating-add", lambda r: Response(status=204, headers=_cors_headers()))
+
     # Отдаём robots.txt, чтобы боты (например, Яндекс) не вызывали 404 и не засоряли логи
     async def robots_handler(request):
         """
@@ -5840,25 +5914,17 @@ def setup_http_server():
                                 tx_address, amount_nanoton, payload_b64 = await _fragment_get_buy_link(req_id)
                                 payload_decoded = _fragment_encoded(payload_b64)
                                 tx_hash, send_err = await _ton_wallet_send_safe(tx_address, amount_nanoton, payload_decoded)
-                                if tx_hash:
-                                    logger.info(f"CryptoBot webhook: stars delivered via Fragment, invoice_id={invoice_id}, recipient={recipient}, stars={stars_amount}, tx={tx_hash}")
-                                    order_meta["delivered"] = True
-                                    if isinstance(orders, dict):
-                                        orders[str(invoice_id)]["delivered"] = True
-                                    _save_cryptobot_order_to_file(str(invoice_id), order_meta)
-                                    
-                                    # Записываем покупку в базу данных (рейтинг) + начисляем рефералы
-                                    try:
+                                # Записываем покупку в рейтинг + начисляем рефералы ОДИН РАЗ (даже если выдача упала по TON)
+                                try:
+                                    if not order_meta.get("rating_recorded"):
                                         import db as _db
                                         purchase_type_str = "stars"
                                         product_name = purchase.get("productName") or purchase.get("product_name") or f"{stars_amount} звёзд"
                                         order_id_custom = str(purchase.get("order_id") or "").strip() or None
-                                        
                                         if _db.is_enabled():
                                             await _db.user_upsert(user_id, purchase.get("username") or "", purchase.get("first_name") or "")
                                             await _db.purchase_add(user_id, amount_rub, stars_amount, purchase_type_str, product_name, order_id_custom)
                                         else:
-                                            # Fallback на JSON файл
                                             path = _get_users_data_path()
                                             users_data = _read_json_file(path) or {}
                                             if user_id not in users_data:
@@ -5878,13 +5944,8 @@ def setup_http_server():
                                                 "productName": product_name,
                                                 "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                                             })
-                                            try:
-                                                with open(path, "w", encoding="utf-8") as f:
-                                                    json.dump(users_data, f, ensure_ascii=False, indent=2)
-                                            except Exception as file_err:
-                                                logger.warning(f"Failed to write users_data.json (webhook stars): {file_err}")
-                                        
-                                        # Начисление рефералов
+                                            with open(path, "w", encoding="utf-8") as f:
+                                                json.dump(users_data, f, ensure_ascii=False, indent=2)
                                         try:
                                             await _apply_referral_earnings_for_purchase(
                                                 user_id=user_id,
@@ -5894,10 +5955,19 @@ def setup_http_server():
                                             )
                                         except Exception as ref_err:
                                             logger.warning(f"Failed to update referral earnings (webhook stars): {ref_err}")
-                                        
-                                        logger.info(f"CryptoBot webhook: stars purchase recorded, invoice_id={invoice_id}, user_id={user_id}, amount_rub={amount_rub}")
-                                    except Exception as record_err:
-                                        logger.exception(f"CryptoBot webhook: error recording stars purchase for invoice_id={invoice_id}: {record_err}")
+                                        order_meta["rating_recorded"] = True
+                                        if isinstance(orders, dict):
+                                            orders[str(invoice_id)]["rating_recorded"] = True
+                                        _save_cryptobot_order_to_file(str(invoice_id), order_meta)
+                                except Exception as record_err:
+                                    logger.exception(f"CryptoBot webhook: error recording stars purchase for invoice_id={invoice_id}: {record_err}")
+
+                                if tx_hash:
+                                    logger.info(f"CryptoBot webhook: stars delivered via Fragment, invoice_id={invoice_id}, recipient={recipient}, stars={stars_amount}, tx={tx_hash}")
+                                    order_meta["delivered"] = True
+                                    if isinstance(orders, dict):
+                                        orders[str(invoice_id)]["delivered"] = True
+                                    _save_cryptobot_order_to_file(str(invoice_id), order_meta)
                                 else:
                                     logger.error(f"CryptoBot webhook: failed to deliver stars, invoice_id={invoice_id}, error={send_err}")
                                     # Уведомляем админов, если TON не хватает или есть другая ошибка выдачи
